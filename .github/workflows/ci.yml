@@ -3,9 +3,28 @@ name: CI
 on:
   push:
     branches: [main]
+  pull_request:
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+      - run: pytest tests/ -q
+
   release-please:
+    # Push-only. The workflow gained a pull_request trigger so the test job
+    # runs on PRs; without this guard release-please would run there too —
+    # and it asks for contents:write and pull-requests:write, which a FORK
+    # PR's token cannot grant whatever this block says. Every external
+    # contributor would see a failed check unrelated to their change.
+    # deploy has needs: release-please, so skipping this skips that too,
+    # which is correct: deploy must never run on a PR.
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: write
