@@ -176,10 +176,10 @@ sudo systemctl start swee
 
 Manage the running bot with `systemctl {status,stop,restart} swee` and `journalctl -u swee -f`.
 
-Pushes to `main` update a standing release-please Release PR; merging *that* PR is what deploys
-this running instance and tags a release — see [`docs/deployment.md`](docs/deployment.md) for the
-full CI/CD and versioning
-mechanics.
+Pushes to `main` update a standing release-please Release PR; merging *that* PR tags a release.
+It does not deploy anything — deployment is done separately by `lychee-ops`, which installs a
+release tag pinned there once this repo's `test` job is green for it. See
+[`docs/deployment.md`](docs/deployment.md) for the full CI/CD and versioning mechanics.
 
 ## Requirements
 

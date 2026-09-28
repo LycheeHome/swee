@@ -3,37 +3,48 @@
 Deep-dive reference for `swee`'s CI/CD and release process. See the [README](../README.md#deployment)
 for the quick-start version.
 
-## Continuous deployment
+## Deployment
 
-`.github/workflows/ci.yml` runs on every push to `main`. Its `release-please` job (see
-Versioning below) determines whether that push produced a new release; only when it did does
-the `deploy` job run, on a self-hosted GitHub Actions runner installed on the same host as the
-bot (see [GitHub's
-docs](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/add-runners)
-for installing the runner itself). Merging an ordinary feature PR to `main` does **not** deploy
-by itself — see Versioning below for what does. When `deploy` runs, it `cd`s into the deployed
-repo, specified by the **required** `SWEE_DIR` repo variable (the canonical absolute path to the
-deployed repo — no trailing slash or symlinks, matching what `deploy/setup.sh` resolves via
-`cd ... && pwd`), does a `git pull --ff-only`, reinstalls dependencies, and restarts
-`swee.service`. No inbound access to the host is required since the runner polls GitHub
-outbound; `deploy/setup.sh` installs the passwordless-sudo rule (`systemctl restart swee`) the
-workflow needs to restart the service non-interactively.
+**This repository does not deploy itself.** `.github/workflows/ci.yml` runs tests and
+release-please, both on GitHub-hosted runners, and stops there. Nothing in CI touches the
+host — deliberately: a self-hosted runner reachable from a public repository is a remote code
+execution path onto the machine it runs on, because a fork supplies its own workflow file and
+therefore its own `runs-on:`.
 
-By default the runner is assumed to run as the same OS user `swee` itself runs as (matching
-`deploy/setup.sh`'s default). To run the GitHub Actions runner as a separate, dedicated OS user instead
-(recommended once this host runs apps beyond this one) — so the runner never needs direct file access to
-any app's directory — set both of the following together:
+Deployment to the live bot is done by [`lychee-ops`](https://github.com/LycheeHome/lychee-ops),
+a private Ansible repo that runs `ansible-pull` on the host every five minutes. Each tick it:
 
-- Run `deploy/setup.sh` with `RUNNER_USER=<runner's OS user>` set, e.g.
-  `RUNNER_USER=github-runner ./deploy/setup.sh`. This grants `<runner's OS user>` passwordless sudo to run
-  `deploy/ci-deploy.sh` as `swee`'s own OS user, and to restart `swee.service`.
-- Set the `SWEE_USER` repo variable (alongside the existing `SWEE_DIR`) to `swee`'s own OS user. This
-  tells `ci.yml` to delegate deploys via `sudo -u "$SWEE_USER" -H "$SWEE_DIR/deploy/ci-deploy.sh"` instead of running
-  `git pull`/`pip install` directly.
+1. reads the release tag pinned in its own `group_vars` as `swee_version`;
+2. checks this repository's Actions API for a **completed workflow run containing a job named
+   `test` that concluded `success`** for that tag's commit;
+3. only if that passes, checks out the tag, reinstalls dependencies, restarts `swee.service`,
+   and waits for the bot to reach Discord before calling it deployed.
 
-Leave both unset to keep the current single-user behavior, where the runner's own OS user must already
-have write access to `$SWEE_DIR`. `swee.service`'s own `User=` and the bot's own Palworld-restart sudo
-rule are unaffected either way — only the CI identity changes.
+### What this changes for you
+
+**Merging the Release PR no longer deploys anything.** It cuts the tag and publishes the GitHub
+Release, which is all. Deploying that release is a separate, deliberate act: someone bumps
+`swee_version` in `lychee-ops` and merges it. That is the rollback lever too — pointing the pin
+at an older tag reverts the bot within one tick, with no access to the host required.
+
+**Do not rename the `test` job.** The gate matches a *job* named exactly `test` in
+`.github/workflows/ci.yml`. Renaming the job key, or adding a `name:` override (which replaces
+the name the API reports), breaks nothing loudly — it silently stops every future deploy, and
+the status file on the host then reports the tag as having no `test` job, which reads like CI
+never ran rather than like a rename.
+
+**A release cut before the `test` job existed can never be deployed.** The gate requires a green
+`test` for the pinned tag's commit, and that job was added in September 2026, so older releases
+block permanently rather than eventually succeeding. This is accepted behaviour: old versions
+age out of rollback range.
+
+### Deploying this bot somewhere else
+
+`deploy/setup.sh` remains the standalone install path and is unaffected by any of the above — it
+creates the venv, installs dependencies, checks the Palworld service exists, installs the
+passwordless-sudo rule the bot needs to restart it, and installs `swee.service`. It sets up a
+host; it does not wire up continuous deployment, and there is no longer anything in this repo
+that does.
 
 ## Versioning
 
@@ -49,10 +60,9 @@ On every push to `main`, release-please updates a standing **Release PR** (title
 version bump, though it may still appear in the changelog depending on release-please's default
 section mapping.
 
-**Nothing ships until you merge that Release PR.** Merging it is what tags the release, publishes
-the GitHub Release, and — via the `deploy` job's dependency on `release_created` — triggers the
-actual deploy. Ordinary feature PRs merging to `main` only update the Release PR's diff; they
-don't deploy or release anything by themselves.
+**No release exists until you merge that Release PR.** Merging it tags the release and publishes
+the GitHub Release — and stops there. Ordinary feature PRs merging to `main` only update the
+Release PR's diff. Neither deploys anything; see Deployment above for what does.
 
 Reserve `!`/`BREAKING CHANGE:` for changes that break an existing deployment on upgrade — e.g. a
 new required `.env` var, a removed/renamed slash command, a changed REST config shape.
