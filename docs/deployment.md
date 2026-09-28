@@ -64,5 +64,31 @@ section mapping.
 the GitHub Release — and stops there. Ordinary feature PRs merging to `main` only update the
 Release PR's diff. Neither deploys anything; see Deployment above for what does.
 
+### Cutting a release when nothing releasable has landed
+
+Only `feat`, `fix` and `perf` (and `!`/`BREAKING CHANGE:`) produce a version bump. A run of
+`ci:`, `docs:`, `chore:`, `style:`, `test:`, `refactor:`, `build:` or `revert:` commits
+accumulates on `main` without release-please opening a Release PR at all — there is nothing for
+it to propose.
+
+That matters more than it used to. Deployment installs a **release tag**, so a repository with
+no new release has nothing new to deploy, however many commits have landed. A CI-only fix that
+needs to reach the host will sit on `main` indefinitely unless a release is cut for it.
+
+To force one, add a `Release-As:` footer:
+
+```
+Release-As: 2.11.3
+```
+
+**Put it in the pull request body.** This repository squash-merges with the PR body as the
+commit message (`squash_merge_commit_message: PR_BODY`), so the footer lands in the commit on
+`main`, which is where release-please looks. Keep it as the last line.
+
+If that repository setting is ever changed to `COMMIT_MESSAGES`, the PR body stops reaching the
+commit and the footer is silently dropped — no release, no error. Put it in the branch's own
+commit message in that case. release-please reads commits, not pull requests; the PR body only
+works here because of how this repo happens to squash.
+
 Reserve `!`/`BREAKING CHANGE:` for changes that break an existing deployment on upgrade — e.g. a
 new required `.env` var, a removed/renamed slash command, a changed REST config shape.
