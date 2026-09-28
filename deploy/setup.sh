@@ -69,19 +69,12 @@ else
     echo "    Already configured, skipping"
 fi
 
-echo "==> Checking passwordless sudo for 'systemctl restart swee' (as $SWEE_USER)"
-SWEE_SUDOERS_FILE="/etc/sudoers.d/swee-self-restart"
-SWEE_SUDOERS_LINE="$SWEE_USER ALL=(root) NOPASSWD: /usr/bin/systemctl restart swee"
-if [ "$(sudo cat "$SWEE_SUDOERS_FILE" 2>/dev/null || true)" != "$SWEE_SUDOERS_LINE" ]; then
-    TMP_SUDOERS="$(mktemp)"
-    echo "$SWEE_SUDOERS_LINE" > "$TMP_SUDOERS"
-    sudo visudo -cf "$TMP_SUDOERS"
-    sudo install -m 440 -o root -g root "$TMP_SUDOERS" "$SWEE_SUDOERS_FILE"
-    rm -f "$TMP_SUDOERS"
-    echo "    Installed $SWEE_SUDOERS_FILE"
-else
-    echo "    Already configured, skipping"
-fi
+# There is deliberately no NOPASSWD grant for 'systemctl restart swee'.
+# One used to live here so a self-hosted CI runner could restart the bot
+# after deploying it; that deploy path is gone (see docs/deployment.md), so
+# the grant would be a standing sudo right with nothing left to use it.
+# If you wire up your own deployment and it needs to restart the service,
+# add the grant there, where whatever needs it is visible.
 
 echo "==> Checking '$SWEE_USER' can read unattended-upgrades logs (adm group)"
 if id -nG "$SWEE_USER" | tr ' ' '\n' | grep -qx adm; then
