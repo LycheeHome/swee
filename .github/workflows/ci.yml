@@ -22,8 +22,6 @@ jobs:
     # and it asks for contents:write and pull-requests:write, which a FORK
     # PR's token cannot grant whatever this block says. Every external
     # contributor would see a failed check unrelated to their change.
-    # deploy has needs: release-please, so skipping this skips that too,
-    # which is correct: deploy must never run on a PR.
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
@@ -36,24 +34,3 @@ jobs:
         id: release
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-
-  deploy:
-    needs: release-please
-    if: needs.release-please.outputs.release_created == 'true'
-    runs-on: self-hosted
-    steps:
-      - name: Pull latest and restart service
-        env:
-          SWEE_DIR: ${{ vars.SWEE_DIR }}
-          SWEE_USER: ${{ vars.SWEE_USER }}
-        run: |
-          set -euo pipefail
-          : "${SWEE_DIR:?SWEE_DIR repo variable must be set}"
-          if [ -n "${SWEE_USER:-}" ]; then
-            sudo -u "$SWEE_USER" -H "$SWEE_DIR/deploy/ci-deploy.sh"
-          else
-            cd "$SWEE_DIR"
-            git pull --ff-only origin main
-            .venv/bin/pip install -q -r requirements.txt
-          fi
-          sudo systemctl restart swee
