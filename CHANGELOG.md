@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.11.3](https://github.com/LycheeHome/swee/compare/v2.11.2...v2.11.3) (2026-09-28)
+
+
+### Documentation
+
+* how to cut a release when nothing releasable has landed ([#70](https://github.com/LycheeHome/swee/issues/70)) ([8bfa452](https://github.com/LycheeHome/swee/commit/8bfa45292d4ee1b0b18e3e1348f6f0f32d966323))
+
 ## [2.11.2](https://github.com/Lychee-Home/swee/compare/v2.11.1...v2.11.2) (2026-07-24)
 
 
