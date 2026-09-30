@@ -18,7 +18,6 @@ os.environ.setdefault("REST_PORT", "1")
 os.environ.setdefault("REST_USER", "x")
 os.environ.setdefault("REST_PASSWORD", "x")
 os.environ.setdefault("PALWORLD_SETTINGS_INI_PATH", "/tmp/x")
-os.environ.setdefault("PALWORLD_INSTALL_DIR", "/tmp")
 
 from swee.player_history import player_history, resolve_owner_name  # noqa: E402
 

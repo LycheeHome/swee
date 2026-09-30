@@ -17,7 +17,6 @@ os.environ.setdefault("REST_PORT", "1")
 os.environ.setdefault("REST_USER", "x")
 os.environ.setdefault("REST_PASSWORD", "x")
 os.environ.setdefault("PALWORLD_SETTINGS_INI_PATH", "/tmp/x")
-os.environ.setdefault("PALWORLD_INSTALL_DIR", "/tmp")
 
 from swee.assistant import is_on_cooldown, parse_mention, record_answered, fuzzy_match_pal_name, clear_session, pop_session, resolve_player_id, append_exchange
 

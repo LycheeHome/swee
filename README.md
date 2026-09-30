@@ -112,12 +112,12 @@ tick rather than skipping it. Leave `PALFEED_SERVICE_URL` unset/blank to disable
 
 ### Server update
 
-`/update` saves the world, stops the Palworld service, runs `steamcmd` against
-`PALWORLD_INSTALL_DIR` to update and validate the dedicated server install, then starts the service
-back up. The shutdown this causes is treated as planned (no "restarted unexpectedly" alert), and
-the existing "Server is online" log-tailer message reports the new version once it's back up. If
-`steamcmd` fails, the service is still restarted with the previously-installed files rather than
-left down.
+`/update` saves the world, stops the Palworld service, runs the host's `SWEE_UPDATE_WRAPPER` (a
+no-argument wrapper declared by `lychee-ops` that runs `steamcmd` against the pinned install as
+`steam`) to update and validate the dedicated server install, then starts the service back up. The
+shutdown this causes is treated as planned (no "restarted unexpectedly" alert), and the existing
+"Server is online" log-tailer message reports the new version once it's back up. If the wrapper
+fails, the service is still restarted with the previously-installed files rather than left down.
 
 ## Setup
 
