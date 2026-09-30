@@ -5,13 +5,11 @@ import time
 import discord
 
 import swee.restart as restart_module
-from swee.config import COLOR_LEAVE, COLOR_READY, PALWORLD_INSTALL_DIR, PALWORLD_SERVICE_NAME, RAM_RESTART_WARNING_SEC, STEAMCMD_PATH
+from swee.config import COLOR_LEAVE, COLOR_READY, PALWORLD_SERVICE_NAME, RAM_RESTART_WARNING_SEC, SWEE_UPDATE_WRAPPER
 from swee.rest_client import rest
 from swee.restart import warn_and_wait
 
 log = logging.getLogger("swee")
-
-PALWORLD_STEAM_APP_ID = "2394010"
 
 
 async def update_palworld(on_progress=None):
@@ -36,7 +34,23 @@ async def update_palworld(on_progress=None):
         if on_progress:
             await on_progress("Stopping server…")
         proc = await asyncio.create_subprocess_exec("sudo", "systemctl", "stop", PALWORLD_SERVICE_NAME)
-        await proc.wait()
+        stop_rc = await proc.wait()
+        if stop_rc != 0:
+            # Abort rather than continue. Running the update wrapper's
+            # steamcmd +app_update validate against a LIVE server is the
+            # dangerous half of this flow — until this check existed, a
+            # silently-failed stop led straight into it, then polled a
+            # server that had never gone down, found it up, and reported
+            # success.
+            log.error("server update: stop failed with rc=%s, aborting", stop_rc)
+            embed = discord.Embed(title="Update failed", color=COLOR_LEAVE)
+            embed.add_field(
+                name="Status",
+                value=f"Could not stop {PALWORLD_SERVICE_NAME} (exit {stop_rc}). "
+                      "The server was left running and nothing was updated.",
+                inline=False,
+            )
+            return embed
 
         if on_progress:
             await on_progress("Updating via steamcmd… this can take a few minutes")
@@ -44,24 +58,25 @@ async def update_palworld(on_progress=None):
         steamcmd_output = ""
         try:
             steamcmd_proc = await asyncio.create_subprocess_exec(
-                STEAMCMD_PATH,
-                "+force_install_dir", PALWORLD_INSTALL_DIR,
-                "+login", "anonymous",
-                "+app_update", PALWORLD_STEAM_APP_ID, "validate",
-                "+quit",
+                "sudo", SWEE_UPDATE_WRAPPER,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
             )
             stdout, _ = await steamcmd_proc.communicate()
             steamcmd_ok = steamcmd_proc.returncode == 0
             steamcmd_output = stdout.decode(errors="replace").strip()
         except Exception as e:
-            log.exception("server update: failed to run steamcmd")
+            log.exception("server update: failed to run the update wrapper")
             steamcmd_output = str(e)
 
         if on_progress:
             await on_progress("Starting server…")
         start_proc = await asyncio.create_subprocess_exec("sudo", "systemctl", "start", PALWORLD_SERVICE_NAME)
-        await start_proc.wait()
+        start_rc = await start_proc.wait()
+        if start_rc != 0:
+            # Not fatal — the liveness poll below already reports a server
+            # that doesn't come back. This just turns that into one
+            # identifiable line instead of a 120-second mystery.
+            log.error("server update: start failed with rc=%s", start_rc)
 
         start = time.monotonic()
         timeout = 120
