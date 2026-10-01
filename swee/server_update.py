@@ -115,6 +115,18 @@ async def update_palworld(on_progress=None):
                 COLOR_LEAVE,
                 channel_id=ALERTS_CHANNEL_ID,
             )
+            # warn_and_wait announced in-game as well as in Discord, so a
+            # Discord-only retraction leaves the players who were actually
+            # told still expecting a restart. The server is up on this path
+            # — the abort below says so — so the REST announce will land.
+            # Best-effort: a failed retraction must not mask the real abort.
+            try:
+                await rest.announce(
+                    f"Update cancelled — {PALWORLD_SERVICE_NAME} could not be stopped. "
+                    "The server is staying up."
+                )
+            except Exception:
+                log.warning("server update: in-game retraction failed", exc_info=True)
             embed = discord.Embed(title="Update failed", color=COLOR_LEAVE)
             embed.add_field(
                 name="Status",

@@ -32,10 +32,17 @@ async def _try_edit(interaction, embed):
     harmless: the next one, or the final result, will still show up (via
     _deliver_result) whenever the token/connection recovers.
     """
+    # except Exception, not except discord.HTTPException. HTTPException does
+    # not cover the network failures that reach here: discord.py's HTTPClient
+    # re-raises OSError for most errnos, and aiohttp's ServerTimeoutError is
+    # an asyncio.TimeoutError — so a DNS blip or TLS failure during the
+    # "Starting server…" edit would still propagate between the stop and the
+    # start and leave the game server down. A best-effort progress callback
+    # has nothing it needs to propagate; the cause is in exc_info.
     try:
         await interaction.edit_original_response(embed=embed)
-    except discord.HTTPException:
-        log.warning("progress update dropped (interaction token likely expired)", exc_info=True)
+    except Exception:
+        log.warning("progress update dropped; continuing", exc_info=True)
 
 
 async def _deliver_result(interaction, embed):
@@ -45,18 +52,21 @@ async def _deliver_result(interaction, embed):
     silently vanish, the admin has no way to know whether /update or
     /restart succeeded, failed, or is still running some other error.
     """
+    # Same reasoning as _try_edit for the breadth: an expired token is the
+    # likely cause but not the only one, and naming it in the log would be
+    # the same overclaim this branch has already had to fix twice.
     try:
         await interaction.edit_original_response(embed=embed)
         return
-    except discord.HTTPException:
-        log.warning("final result edit failed (interaction token likely expired); falling back to channel send", exc_info=True)
+    except Exception:
+        log.warning("final result edit failed; falling back to channel send", exc_info=True)
     channel = interaction.channel
     if channel is None:
         log.error("no channel available for fallback send; result embed lost")
         return
     try:
         await channel.send(embed=embed)
-    except discord.HTTPException:
+    except Exception:
         log.exception("fallback channel send also failed; result embed lost")
 
 

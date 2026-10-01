@@ -43,10 +43,13 @@ async def restart_palworld(on_progress=None):
     if restart_rc != 0:
         # Same bug server_update.py's stop-failure guard exists to prevent:
         # without this check, a failed restart left the service in whatever
-        # state it was already in, the poll below reported on THAT state
-        # rather than on the restart that was never issued, and a server
-        # that stayed down the whole time could still read "Back online
-        # after 0s".
+        # state it was already in, and the poll below reported on THAT state
+        # rather than on the restart. The concrete case is a server that was
+        # already UP — the poll's first rest.info() succeeds, and the embed
+        # reads "Server restarted — Back online after 0s" having restarted
+        # nothing. (A server left DOWN reports "Restart timed out", which is
+        # wrong about the cause but not a false success.) rc != 0 covers both
+        # a restart sudo refused and one systemd ran and could not complete.
         log.error("restart: systemctl restart failed with rc=%s, aborting", restart_rc)
         embed = discord.Embed(title="Restart failed", color=COLOR_LEAVE)
         embed.add_field(
