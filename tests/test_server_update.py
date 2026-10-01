@@ -1,3 +1,9 @@
+"""Tests for swee/server_update.py's update_palworld(). asyncio.create_
+subprocess_exec is mocked throughout via FakeProc below, so what's verified
+here is the Python-level control flow only — the real sudo grants, the
+update wrapper, and steamcmd's actual exit codes are unverified by this
+suite and can only be checked on the host.
+"""
 import asyncio
 import os
 import unittest
@@ -147,6 +153,56 @@ class UpdatePalworldTests(unittest.TestCase):
         self.warn_and_wait_mock.assert_not_called()
         self.assertEqual(embed.title, "Update failed")
         self.assertIn("systemctl stop", embed.fields[0].value)
+
+    def test_failed_wrapper_with_successful_restart_reports_old_install_is_back(self):
+        """start_rc == 0 arm of the steamcmd_ok split (c2a824b). Neither
+        arm was reachable before: the failed-stop test above returns
+        before the wrapper ever runs, and the other two tests have the
+        wrapper exiting 0. Here the wrapper fails but the restart
+        afterward succeeds, so the embed must say the previously-installed
+        files are back up rather than leaving that ambiguous."""
+
+        async def fake_exec(*args, **kwargs):
+            if _is_preflight_call(args):
+                return FakeProc(0)
+            if args == ("sudo", server_update.SWEE_UPDATE_WRAPPER):
+                return FakeProc(8, b"Error! App '2394010' state is 0x202 after update job.")
+            return FakeProc(0)  # systemctl stop and start both succeed
+
+        with patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
+            embed = asyncio.run(server_update.update_palworld())
+
+        self.assertEqual(embed.title, "Update failed")
+        self.assertIn("state is 0x202", embed.fields[0].value)
+        self.assertIn("still restarted", embed.fields[1].value)
+
+    def test_failed_wrapper_and_failed_start_reports_compound_failure(self):
+        """The compound case named in review: the wrapper fails AND the
+        restart afterward also fails. This is the arm where the wording
+        matters most — the operator needs to know the server is down, not
+        just that the update itself failed."""
+
+        async def fake_exec(*args, **kwargs):
+            if _is_preflight_call(args):
+                return FakeProc(0)
+            if args == ("sudo", server_update.SWEE_UPDATE_WRAPPER):
+                return FakeProc(8, b"Error! App '2394010' state is 0x202 after update job.")
+            if "start" in args:
+                return FakeProc(1)
+            return FakeProc(0)  # stop succeeds
+
+        with patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
+            with self.assertLogs("swee", level="ERROR") as logs:
+                embed = asyncio.run(server_update.update_palworld())
+
+        self.assertEqual(embed.title, "Update failed")
+        self.assertIn("state is 0x202", embed.fields[0].value)
+        self.assertIn("restart afterward also failed", embed.fields[1].value)
+        self.assertIn("exit 1", embed.fields[1].value)
+        self.assertTrue(
+            any("start failed" in message for message in logs.output),
+            f"expected a logged start failure, got: {logs.output}",
+        )
 
 
 if __name__ == "__main__":
