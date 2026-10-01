@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.11.4](https://github.com/LycheeHome/swee/compare/v2.11.3...v2.11.4) (2026-10-01)
+
+
+### Bug Fixes
+
+* /update ran steamcmd against a live server ([#73](https://github.com/LycheeHome/swee/issues/73)) ([a3db390](https://github.com/LycheeHome/swee/commit/a3db390604978f15f475e778c6d782f236c652ad))
+
 ## [2.11.3](https://github.com/LycheeHome/swee/compare/v2.11.2...v2.11.3) (2026-09-28)
 
 
