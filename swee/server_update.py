@@ -17,8 +17,8 @@ log = logging.getLogger("swee")
 # wrapper entry carries no arguments: the sudoers drop-in pins it to zero.
 _REQUIRED_SUDO_GRANTS = (
     ("systemctl", "stop", PALWORLD_SERVICE_NAME),
-    ("systemctl", "start", PALWORLD_SERVICE_NAME),
     (SWEE_UPDATE_WRAPPER,),
+    ("systemctl", "start", PALWORLD_SERVICE_NAME),
 )
 
 
