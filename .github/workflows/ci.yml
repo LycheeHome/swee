@@ -15,6 +15,31 @@ jobs:
           python-version: "3.14"
       - run: pip install -r requirements.txt -r requirements-dev.txt
       - run: pytest tests/ -q
+      - name: Verify the entrypoint still imports
+        # Catches a module that can't even be imported (e.g. a typo'd name,
+        # a bad top-level reference) slipping past a green `pytest tests/`
+        # — that suite never imports main.py or commands.py, so an earlier
+        # commit shipped a broken server_update.py and the suite still
+        # reported 92 passed. These are the same env vars tests/ fakes via
+        # os.environ.setdefault; no real secrets needed, main.py never
+        # calls bot.run() at import time.
+        env:
+          DISCORD_BOT_TOKEN: x
+          GUILD_ID: "1"
+          ADMIN_ROLE_ID: "1"
+          RELAY_CHANNEL_ID: "1"
+          STATS_CHANNEL_ID: "1"
+          ACTIVITY_CHANNEL_ID: "1"
+          ALERTS_CHANNEL_ID: "1"
+          ADMIN_CHANNEL_ID: "1"
+          COMMANDS_CHANNEL_ID: "1"
+          BOT_UPDATES_CHANNEL_ID: "1"
+          REST_HOST: x
+          REST_PORT: "1"
+          REST_USER: x
+          REST_PASSWORD: x
+          PALWORLD_SETTINGS_INI_PATH: /tmp/x
+        run: python -c "import main"
 
   release-please:
     # Push-only. The workflow gained a pull_request trigger so the test job
