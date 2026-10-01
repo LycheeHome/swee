@@ -81,6 +81,10 @@ class UpdatePalworldTests(unittest.TestCase):
         self.assertNotIn(wrapper_run, calls, "the update wrapper ran after a failed stop")
         self.assertEqual(embed.title, "Update failed")
         self.assertIn("not restarted", embed.fields[0].value)
+        # A leaked True here would make log_tailer.py treat every future
+        # unplanned shutdown as a planned one, permanently, with no test
+        # failing — see swee/log_tailer.py:126.
+        self.assertFalse(server_update.restart_module._bot_restart_in_progress)
 
     def test_successful_flow_invokes_the_wrapper_not_steamcmd_directly(self):
         calls = []
