@@ -46,8 +46,9 @@ async def update_palworld(on_progress=None):
             embed = discord.Embed(title="Update failed", color=COLOR_LEAVE)
             embed.add_field(
                 name="Status",
-                value=f"Could not stop {PALWORLD_SERVICE_NAME} (exit {stop_rc}). "
-                      "The server was left running and nothing was updated.",
+                value=f"Could not stop {PALWORLD_SERVICE_NAME} (exit {stop_rc}). Nothing was "
+                      f"updated and the server was not restarted — check "
+                      f"`systemctl status {PALWORLD_SERVICE_NAME}`.",
                 inline=False,
             )
             return embed

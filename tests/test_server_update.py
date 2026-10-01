@@ -68,7 +68,7 @@ class UpdatePalworldTests(unittest.TestCase):
         wrapper_calls = [c for c in calls if server_update.SWEE_UPDATE_WRAPPER in c]
         self.assertEqual(wrapper_calls, [], "the update wrapper ran after a failed stop")
         self.assertEqual(embed.title, "Update failed")
-        self.assertIn("left running", embed.fields[0].value)
+        self.assertIn("not restarted", embed.fields[0].value)
 
     def test_successful_flow_invokes_the_wrapper_not_steamcmd_directly(self):
         calls = []
