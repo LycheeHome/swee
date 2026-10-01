@@ -76,6 +76,16 @@ fi
 # If you wire up your own deployment and it needs to restart the service,
 # add the grant there, where whatever needs it is visible.
 
+# This script also does NOT install the three additional grants /update
+# needs (passwordless 'systemctl stop'/'systemctl start' for the Palworld
+# service, plus the host-side update wrapper) — it only ever installed the
+# single restart grant above. It can't install the wrapper even if it
+# wanted to: that binary is lychee-ops' artifact, rendered from that repo's
+# group_vars, not something a standalone script in this repo can produce.
+# See the README's "Running" section for the full grant list; on a host
+# set up only by this script, /update will abort at its own preflight
+# check rather than attempt anything against a live server.
+
 echo "==> Checking '$SWEE_USER' can read unattended-upgrades logs (adm group)"
 if id -nG "$SWEE_USER" | tr ' ' '\n' | grep -qx adm; then
     echo "    Already in adm group, skipping"

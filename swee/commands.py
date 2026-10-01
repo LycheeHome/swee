@@ -16,6 +16,60 @@ from swee.server_update import update_palworld
 log = logging.getLogger("swee")
 
 
+async def _try_edit(interaction, embed):
+    """Best-effort edit of the interaction's original response, for
+    in-flight progress updates. A Discord interaction token is only valid
+    for 15 minutes; /update's flow (a warning sleep, a world save, a
+    systemctl stop, and a full steamcmd validate against a ~9 GB install)
+    can plausibly exceed that on a real content update — the first /update
+    after months of broken ones is the likely case. If the token has
+    expired (edit_original_response raises discord.NotFound) or Discord
+    hiccups with a transient 5xx (discord.HTTPException), letting that
+    propagate out of a progress callback would abort whatever mutating
+    work is in flight at that point (e.g. skip straight past `systemctl
+    start`) — the exact failure class this code exists to prevent,
+    arriving through a different door. A dropped progress update is
+    harmless: the next one, or the final result, will still show up (via
+    _deliver_result) whenever the token/connection recovers.
+    """
+    # except Exception, not except discord.HTTPException. HTTPException does
+    # not cover the network failures that reach here: discord.py's HTTPClient
+    # re-raises OSError for most errnos, and aiohttp's ServerTimeoutError is
+    # an asyncio.TimeoutError — so a DNS blip or TLS failure during the
+    # "Starting server…" edit would still propagate between the stop and the
+    # start and leave the game server down. A best-effort progress callback
+    # has nothing it needs to propagate; the cause is in exc_info.
+    try:
+        await interaction.edit_original_response(embed=embed)
+    except Exception:
+        log.warning("progress update dropped; continuing", exc_info=True)
+
+
+async def _deliver_result(interaction, embed):
+    """Deliver a command's final result embed, falling back to a plain
+    channel message if editing the original response fails. Same 15-minute
+    token risk as _try_edit, but here it's the final outcome — if we let it
+    silently vanish, the admin has no way to know whether /update or
+    /restart succeeded, failed, or is still running some other error.
+    """
+    # Same reasoning as _try_edit for the breadth: an expired token is the
+    # likely cause but not the only one, and naming it in the log would be
+    # the same overclaim this branch has already had to fix twice.
+    try:
+        await interaction.edit_original_response(embed=embed)
+        return
+    except Exception:
+        log.warning("final result edit failed; falling back to channel send", exc_info=True)
+    channel = interaction.channel
+    if channel is None:
+        log.error("no channel available for fallback send; result embed lost")
+        return
+    try:
+        await channel.send(embed=embed)
+    except Exception:
+        log.exception("fallback channel send also failed; result embed lost")
+
+
 @bot.tree.command(description="Show server status")
 @in_commands_channel()
 async def status(interaction: discord.Interaction):
@@ -90,18 +144,18 @@ async def restart(interaction: discord.Interaction):
     )
 
     embed.set_field_at(0, name="Status", value="Sending restart command…")
-    await interaction.edit_original_response(embed=embed)
+    await _try_edit(interaction, embed)
 
     async def on_progress(status):
         embed.set_field_at(0, name="Status", value=status)
-        await interaction.edit_original_response(embed=embed)
+        await _try_edit(interaction, embed)
 
     restart_module._bot_restart_in_progress = True
     try:
         result_embed = await restart_palworld(on_progress)
     finally:
         restart_module._bot_restart_in_progress = False
-    await interaction.edit_original_response(embed=result_embed)
+    await _deliver_result(interaction, result_embed)
 
 
 @bot.tree.command(description="Update the Palworld server via steamcmd")
@@ -116,10 +170,10 @@ async def update(interaction: discord.Interaction):
 
     async def on_progress(status):
         embed.set_field_at(0, name="Status", value=status)
-        await interaction.edit_original_response(embed=embed)
+        await _try_edit(interaction, embed)
 
     result_embed = await update_palworld(on_progress)
-    await interaction.edit_original_response(embed=result_embed)
+    await _deliver_result(interaction, result_embed)
 
 
 @bot.tree.error

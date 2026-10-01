@@ -27,8 +27,14 @@ GITHUB_TOKEN           = os.environ.get("GITHUB_TOKEN")
 ANTHROPIC_API_KEY      = os.environ.get("ANTHROPIC_API_KEY")
 PALWORLD_SETTINGS_INI_PATH = os.environ["PALWORLD_SETTINGS_INI_PATH"]
 PALWORLD_SERVICE_NAME = os.environ.get("PALWORLD_SERVICE_NAME", "palworld")
-PALWORLD_INSTALL_DIR = os.environ["PALWORLD_INSTALL_DIR"]
-STEAMCMD_PATH = os.environ.get("STEAMCMD_PATH", "/usr/games/steamcmd")
+
+# The wrapper lychee-ops installs, invoked through sudo with no arguments.
+# PALWORLD_INSTALL_DIR and STEAMCMD_PATH used to live here and are gone:
+# both are now baked into that wrapper, which is rendered from lychee-ops'
+# group_vars. Keeping them would have left one required environment variable
+# and one optional one that nothing reads — exactly the shape that let
+# GITHUB_REPO sit stale through an org rename with nothing detecting it.
+SWEE_UPDATE_WRAPPER = os.environ.get("SWEE_UPDATE_WRAPPER", "/usr/local/sbin/swee-update-palworld")
 
 _ram_restart_threshold_env = os.environ.get("RAM_RESTART_THRESHOLD_PCT")
 RAM_RESTART_THRESHOLD_PCT = float(_ram_restart_threshold_env) if _ram_restart_threshold_env else None

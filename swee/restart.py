@@ -39,7 +39,26 @@ def check_palworld_service():
 
 async def restart_palworld(on_progress=None):
     proc = await asyncio.create_subprocess_exec("sudo", "systemctl", "restart", PALWORLD_SERVICE_NAME)
-    await proc.wait()
+    restart_rc = await proc.wait()
+    if restart_rc != 0:
+        # Same bug server_update.py's stop-failure guard exists to prevent:
+        # without this check, a failed restart left the service in whatever
+        # state it was already in, and the poll below reported on THAT state
+        # rather than on the restart. The concrete case is a server that was
+        # already UP — the poll's first rest.info() succeeds, and the embed
+        # reads "Server restarted — Back online after 0s" having restarted
+        # nothing. (A server left DOWN reports "Restart timed out", which is
+        # wrong about the cause but not a false success.) rc != 0 covers both
+        # a restart sudo refused and one systemd ran and could not complete.
+        log.error("restart: systemctl restart failed with rc=%s, aborting", restart_rc)
+        embed = discord.Embed(title="Restart failed", color=COLOR_LEAVE)
+        embed.add_field(
+            name="Status",
+            value=f"Could not restart {PALWORLD_SERVICE_NAME} (exit {restart_rc}) — check "
+                  f"`systemctl status {PALWORLD_SERVICE_NAME}` and `journalctl -u swee`.",
+            inline=False,
+        )
+        return embed
 
     if on_progress:
         await on_progress("Waiting for server to come back online…")
