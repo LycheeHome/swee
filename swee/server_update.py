@@ -5,7 +5,8 @@ import time
 import discord
 
 import swee.restart as restart_module
-from swee.config import COLOR_LEAVE, COLOR_READY, PALWORLD_SERVICE_NAME, RAM_RESTART_WARNING_SEC, SWEE_UPDATE_WRAPPER
+from swee.config import ALERTS_CHANNEL_ID, COLOR_LEAVE, COLOR_READY, PALWORLD_SERVICE_NAME, RAM_RESTART_WARNING_SEC, SWEE_UPDATE_WRAPPER
+from swee.embeds import broadcast_embed
 from swee.rest_client import rest
 from swee.restart import warn_and_wait
 
@@ -101,12 +102,28 @@ async def update_palworld(on_progress=None):
             # server that had never gone down, found it up, and reported
             # success.
             log.error("server update: stop failed with rc=%s, aborting", stop_rc)
+            # Players already saw the "restarting in Ns for an update"
+            # warning (in-game and in the alerts channel) before this point
+            # — retract it so they aren't left thinking an update is still
+            # coming when the bot has in fact given up. broadcast_embed is
+            # itself best-effort (logs and swallows its own failures), so a
+            # failed retraction can't mask the real abort below.
+            await broadcast_embed(
+                "Update aborted",
+                f"Could not stop {PALWORLD_SERVICE_NAME} — the update was cancelled and "
+                "nothing was changed. The server was never taken down.",
+                COLOR_LEAVE,
+                channel_id=ALERTS_CHANNEL_ID,
+            )
             embed = discord.Embed(title="Update failed", color=COLOR_LEAVE)
             embed.add_field(
                 name="Status",
                 value=f"Could not stop {PALWORLD_SERVICE_NAME} (exit {stop_rc}). Nothing was "
                       f"updated and the server was not restarted — check "
-                      f"`systemctl status {PALWORLD_SERVICE_NAME}`.",
+                      f"`systemctl status {PALWORLD_SERVICE_NAME}` and `journalctl -u swee` "
+                      "(the stop/start subprocesses inherit this bot's own stdout/stderr, so "
+                      "systemctl's real error reaches the bot's log even when an "
+                      "already-recovered unit makes `systemctl status` alone look fine).",
                 inline=False,
             )
             return embed
