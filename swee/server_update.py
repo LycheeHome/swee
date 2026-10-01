@@ -143,7 +143,15 @@ async def update_palworld(on_progress=None):
         if len(steamcmd_output) > 500:
             tail = "…" + tail
         embed.add_field(name="steamcmd output", value=f"```{tail}```" if tail else "(no output)", inline=False)
-        embed.add_field(name="Status", value="Server was still restarted with the existing install.", inline=False)
+        if start_rc == 0:
+            embed.add_field(name="Status", value="Server was still restarted with the existing install.", inline=False)
+        else:
+            embed.add_field(
+                name="Status",
+                value=f"The restart afterward also failed (exit {start_rc}) — check "
+                      f"`systemctl status {PALWORLD_SERVICE_NAME}`.",
+                inline=False,
+            )
         return embed
 
     if not online:
