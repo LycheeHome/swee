@@ -158,6 +158,13 @@ The user running the bot must also have passwordless `sudo` configured for the
 `systemctl restart <PALWORLD_SERVICE_NAME>` command (e.g. via a `NOPASSWD` sudoers entry) —
 otherwise the bot exits immediately at startup with a clear error in the log.
 
+`/update` needs three more grants beyond that one: passwordless `systemctl stop` and
+`systemctl start` for the same service, plus the host's `SWEE_UPDATE_WRAPPER` (see
+[Server update](#server-update) above). None of these three are checked at startup the way the
+restart grant is — only `/update`'s own preflight catches a missing one, when the command is run.
+The wrapper itself is declared and installed by `lychee-ops`, not by this repo; see
+[`docs/deployment.md`](docs/deployment.md).
+
 ## Deployment
 
 For a Linux host you set up once and leave running, `deploy/setup.sh` automates the steps above
