@@ -25,15 +25,16 @@ import swee.server_update as server_update
 class FakeProc:
     """Stands in for the process object asyncio.create_subprocess_exec returns."""
 
-    def __init__(self, returncode, output=b""):
+    def __init__(self, returncode, output=b"", stderr=b""):
         self.returncode = returncode
         self._output = output
+        self._stderr = stderr
 
     async def wait(self):
         return self.returncode
 
     async def communicate(self):
-        return self._output, None
+        return self._output, self._stderr
 
 
 def _is_preflight_call(args):

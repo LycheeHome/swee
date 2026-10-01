@@ -33,14 +33,26 @@ async def _missing_sudo_grant():
     principals to one, and /update is how that narrowing gets verified, so
     a mis-narrowed grant must be caught here, before a warning has gone out
     to players and the world has been saved, not discovered only after.
+
+    Captures stderr from each `sudo -n -l` check. Per `man sudo` EXIT
+    VALUE, a non-zero return means an authentication failure, OR a
+    configuration/permission problem, OR that the given command can't be
+    executed at all — and only stderr says which. Discarding it (as this
+    used to) left the caller unable to tell a missing sudoers grant apart
+    from a missing/mis-pathed command.
     """
     for cmd in _REQUIRED_SUDO_GRANTS:
         proc = await asyncio.create_subprocess_exec(
             "sudo", "-n", "-l", *cmd,
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
         )
-        rc = await proc.wait()
-        if rc != 0:
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            log.error(
+                "server update: 'sudo -n -l %s' failed (rc=%s): %s",
+                " ".join(cmd), proc.returncode,
+                stderr.decode(errors="replace").strip() or "(no stderr captured)",
+            )
             return " ".join(cmd)
     return None
 
@@ -48,12 +60,13 @@ async def _missing_sudo_grant():
 async def update_palworld(on_progress=None):
     missing_grant = await _missing_sudo_grant()
     if missing_grant is not None:
-        log.error("server update: no NOPASSWD grant for '%s', aborting", missing_grant)
+        log.error("server update: no usable sudo grant for '%s', aborting", missing_grant)
         embed = discord.Embed(title="Update failed", color=COLOR_LEAVE)
         embed.add_field(
             name="Status",
-            value=f"No NOPASSWD sudo grant for `{missing_grant}`. Nothing was touched — "
-                  "check the sudoers drop-in.",
+            value=f"No usable sudo grant for `{missing_grant}`. Nothing was touched — the "
+                  "grant may be missing, or the command itself may not be installed; check "
+                  "the sudoers drop-in and the command's path.",
             inline=False,
         )
         return embed
