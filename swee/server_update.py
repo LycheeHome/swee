@@ -11,8 +11,53 @@ from swee.restart import warn_and_wait
 
 log = logging.getLogger("swee")
 
+# The three sudo grants /update depends on, checked in the order they're
+# used. Each entry is the exact argument list `sudo -n -l` is asked about —
+# it must match the command /update actually runs later, which is why the
+# wrapper entry carries no arguments: the sudoers drop-in pins it to zero.
+_REQUIRED_SUDO_GRANTS = (
+    ("systemctl", "stop", PALWORLD_SERVICE_NAME),
+    ("systemctl", "start", PALWORLD_SERVICE_NAME),
+    (SWEE_UPDATE_WRAPPER,),
+)
+
+
+async def _missing_sudo_grant():
+    """The first of _REQUIRED_SUDO_GRANTS that isn't configured NOPASSWD
+    for this user, or None if all three are. Mirrors restart.py's
+    check_palworld_service, but async rather than subprocess.run: this
+    runs inside update_palworld(), which runs on the bot's event loop, and
+    a blocking call here would stall every other command while sudo is
+    consulted. Checked before anything else in update_palworld() — Phase 4
+    of the identity-separation migration narrows this exact grant from two
+    principals to one, and /update is how that narrowing gets verified, so
+    a mis-narrowed grant must be caught here, before a warning has gone out
+    to players and the world has been saved, not discovered only after.
+    """
+    for cmd in _REQUIRED_SUDO_GRANTS:
+        proc = await asyncio.create_subprocess_exec(
+            "sudo", "-n", "-l", *cmd,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        rc = await proc.wait()
+        if rc != 0:
+            return " ".join(cmd)
+    return None
+
 
 async def update_palworld(on_progress=None):
+    missing_grant = await _missing_sudo_grant()
+    if missing_grant is not None:
+        log.error("server update: no NOPASSWD grant for '%s', aborting", missing_grant)
+        embed = discord.Embed(title="Update failed", color=COLOR_LEAVE)
+        embed.add_field(
+            name="Status",
+            value=f"No NOPASSWD sudo grant for `{missing_grant}`. Nothing was touched — "
+                  "check the sudoers drop-in.",
+            inline=False,
+        )
+        return embed
+
     warning_sec = int(RAM_RESTART_WARNING_SEC)
     if on_progress:
         await on_progress("Broadcasting update warning…")
