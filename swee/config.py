@@ -36,6 +36,11 @@ PALWORLD_SERVICE_NAME = os.environ.get("PALWORLD_SERVICE_NAME", "palworld")
 # GITHUB_REPO sit stale through an org rename with nothing detecting it.
 SWEE_UPDATE_WRAPPER = os.environ.get("SWEE_UPDATE_WRAPPER", "/usr/local/sbin/swee-update-palworld")
 
+# lychee-admin's per-client host-operations socket (A-OPS-1), and the
+# inventory unit name swee operates through it. See swee/host_ops.py.
+HOST_OPS_SOCKET = os.environ.get("HOST_OPS_SOCKET", "/run/lychee-admin/clients/swee/api.sock")
+HOST_OPS_UNIT   = os.environ.get("HOST_OPS_UNIT", "palworld-palchuds")
+
 _ram_restart_threshold_env = os.environ.get("RAM_RESTART_THRESHOLD_PCT")
 RAM_RESTART_THRESHOLD_PCT = float(_ram_restart_threshold_env) if _ram_restart_threshold_env else None
 RAM_RESTART_COOLDOWN_MIN = float(os.environ.get("RAM_RESTART_COOLDOWN_MIN", "15"))
