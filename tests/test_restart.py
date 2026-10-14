@@ -34,6 +34,7 @@ from swee.host_ops import ActionState, HostOpsError
 
 BUSY = "an action is already running on the server"
 UNAVAILABLE = "host control is unavailable right now"
+NOT_ALLOWED = "swee is not allowed to do that"
 SOCKET = "/run/lychee-admin/clients/swee/api.sock"
 NOW = datetime(2026, 10, 14, 18, 0, 0, tzinfo=timezone.utc)
 
@@ -55,8 +56,9 @@ class FakeClock:
         self.t += seconds
 
 
-def fake_host_ops(start=None, wait=None, ping=True):
+def fake_host_ops(start=None, wait=None, ping=True, preflight=None):
     ops = MagicMock()
+    ops.preflight = AsyncMock(side_effect=preflight)
     ops.socket_path = SOCKET
     if isinstance(start, Exception):
         ops.start = AsyncMock(side_effect=start)
@@ -171,43 +173,68 @@ class CheckPalworldServiceTests(unittest.TestCase):
 
 
 class RefusedBeforeWarningTests(unittest.TestCase):
-    """A refusal broadcasts nothing to players: when host control is down,
-    neither /restart nor the RAM auto-restart warns anyone first."""
+    """A refusal broadcasts nothing to players: neither /restart nor the RAM
+    auto-restart warns anyone until preflight() has found nothing in the way,
+    and the refusal shows its own sentence."""
 
-    def test_restart_command_refused_before_anything_is_announced(self):
-        ops = fake_host_ops(ping=False)
+    def run_command(self, ops):
         interaction = MagicMock()
         interaction.response.send_message = AsyncMock()
         interaction.edit_original_response = AsyncMock()
         warn = AsyncMock()
+        broadcast = AsyncMock()
+        announce = AsyncMock()
         with patch.object(restart, "host_ops", ops), \
-             patch.object(commands, "warn_and_wait", warn):
-            with self.assertLogs("swee", level="ERROR"):
+             patch.object(commands, "warn_and_wait", warn), \
+             patch.object(restart, "broadcast_embed", broadcast), \
+             patch.object(restart.rest, "announce", announce):
+            with self.assertLogs("swee", level="ERROR") as logs:
                 asyncio.run(commands.restart.callback(interaction))
-
-        warn.assert_not_called()
-        ops.start.assert_not_called()
+        for mock in (warn, broadcast, announce, ops.start):
+            mock.assert_not_called()
         final = interaction.edit_original_response.call_args.kwargs["embed"]
         self.assertEqual(final.title, "Restart failed")
+        return final, logs
+
+    def test_restart_command_refused_before_anything_is_announced(self):
+        ops = fake_host_ops(preflight=HostOpsError(UNAVAILABLE, "ConnectError: refused"))
+        final, _ = self.run_command(ops)
         self.assertEqual(final.fields[0].value, UNAVAILABLE)
         self.assertFalse(restart._bot_restart_in_progress)
 
-    def test_auto_restart_refused_before_warning(self):
-        ops = fake_host_ops(ping=False)
+    def test_restart_command_not_allowed_shows_its_sentence(self):
+        ops = fake_host_ops(preflight=HostOpsError(NOT_ALLOWED, 'HTTP 403: {"error": "not granted"}', 403))
+        final, logs = self.run_command(ops)
+        self.assertEqual(final.fields[0].value, NOT_ALLOWED)
+        self.assertTrue(any("not granted" in line for line in logs.output), logs.output)
+
+    def test_restart_command_while_own_action_in_flight(self):
+        ops = fake_host_ops()
+        with patch.object(restart, "_bot_restart_in_progress", True):
+            final, _ = self.run_command(ops)
+        self.assertEqual(final.fields[0].value, BUSY)
+        self.assertEqual(ops.mock_calls, [], "no host_ops call while swee's own action runs")
+
+    def test_auto_restart_busy_broadcasts_nothing(self):
+        ops = fake_host_ops(preflight=HostOpsError(BUSY, "update is running", 409))
         warn = AsyncMock()
+        broadcast = AsyncMock()
+        announce = AsyncMock()
         channel = MagicMock(spec=restart.discord.TextChannel)
         channel.send = AsyncMock()
         with patch.object(restart, "host_ops", ops), \
              patch.object(restart, "warn_and_wait", warn), \
+             patch.object(restart, "broadcast_embed", broadcast), \
+             patch.object(restart.rest, "announce", announce), \
              patch.object(restart.bot, "get_channel", return_value=channel):
             with self.assertLogs("swee", level="ERROR"):
                 asyncio.run(restart.auto_restart_sequence(95))
 
-        warn.assert_not_called()
-        ops.start.assert_not_called()
+        for mock in (warn, broadcast, announce, ops.start):
+            mock.assert_not_called()
         sent = channel.send.call_args.kwargs["embed"]
         self.assertEqual(sent.title, "Restart failed")
-        self.assertEqual(sent.fields[0].value, UNAVAILABLE)
+        self.assertEqual(sent.fields[0].value, BUSY)
 
 
 class StartupTests(unittest.TestCase):

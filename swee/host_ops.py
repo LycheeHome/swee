@@ -34,6 +34,9 @@ POLL_INTERVAL_S = 2.0
 # earlier than our POST, less this much clock slack.
 STALE_SLACK = timedelta(seconds=5)
 TERMINAL_STATES = frozenset({"succeeded", "failed"})
+# Every action swee may run on the unit. preflight() reads them all, because
+# lychee-admin refuses any action while another one is running.
+ACTIONS = ("start", "stop", "restart", "update")
 # A terminal state with no usable startedAt (the action failed before its main
 # process ran: ExecStartPre failed, or start-limit-hit) is taken as this run's
 # once this long has passed since the wait began, well past the --no-block
@@ -167,6 +170,19 @@ class HostOps:
             log.info("host-ops socket did not answer: %s (%s)", error.sentence, error.detail)
             return False
         return True
+
+    async def preflight(self) -> None:
+        """Check, before swee warns any player, that a POST would be
+        accepted: GET every action's state. A refusal propagates with its own
+        sentence (403/404, unreachable, 5xx); a `running` action raises the
+        409 sentence. Returns None when nothing is in the way.
+
+        A check, not a reservation: an action can still start between this
+        and the POST, which then meets its own 409."""
+        for action in ACTIONS:
+            current = await self.state(action)
+            if current.state == "running":
+                raise HostOpsError(SENTENCE_BUSY, f"{action} is running on {self.unit}", 409)
 
     async def wait(
         self,

@@ -137,8 +137,9 @@ async def restart(interaction: discord.Interaction):
     embed.add_field(name="Status", value="Checking host control…")
     await interaction.response.send_message(embed=embed)
 
-    # A refusal broadcasts nothing to players: check that lychee-admin
-    # answers before warning anyone that the server is about to restart.
+    # A refusal broadcasts nothing to players: check that lychee-admin would
+    # accept a restart (reachable, allowed, nothing running) before warning
+    # anyone that the server is about to restart.
     refusal = await host_control_refusal()
     if refusal is not None:
         await _deliver_result(interaction, refusal)

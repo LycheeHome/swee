@@ -145,6 +145,43 @@ class HostOpsRequestTests(unittest.TestCase):
         self.assertIsNone(asyncio.run(client.state("restart")).started_at)
 
 
+class HostOpsPreflightTests(unittest.TestCase):
+    """preflight() runs before swee warns players: it GETs every action's
+    state and raises the refusal a POST would meet, with its own sentence."""
+
+    def test_preflight_clear_returns_none(self):
+        seen = []
+        transport = sequence_transport(
+            [(200, body("idle")), (200, body("succeeded")), (200, body("idle")), (200, body("failed"))], seen
+        )
+        self.assertIsNone(asyncio.run(HostOps(transport=transport).preflight()))
+        self.assertEqual(
+            [request.url.path.rsplit("/", 1)[1] for request in seen],
+            ["start", "stop", "restart", "update"],
+        )
+        self.assertTrue(all(request.method == "GET" for request in seen))
+
+    def test_preflight_403_propagates_with_its_sentence(self):
+        transport = sequence_transport([(200, body("idle")), (403, {"error": "not granted"})])
+        with self.assertRaises(HostOpsError) as caught:
+            asyncio.run(HostOps(transport=transport).preflight())
+        self.assertEqual(caught.exception.sentence, "swee is not allowed to do that")
+        self.assertIn("not granted", caught.exception.detail)
+
+    def test_preflight_running_action_is_busy(self):
+        transport = sequence_transport([(200, body("idle")), (200, body("idle")), (200, body("idle")), (200, body("running"))])
+        with self.assertRaises(HostOpsError) as caught:
+            asyncio.run(HostOps(transport=transport).preflight())
+        self.assertEqual(caught.exception.sentence, "an action is already running on the server")
+        self.assertIn("update", caught.exception.detail)
+
+    def test_preflight_unreachable(self):
+        transport = sequence_transport([httpx.ConnectError("refused")])
+        with self.assertRaises(HostOpsError) as caught:
+            asyncio.run(HostOps(transport=transport).preflight())
+        self.assertEqual(caught.exception.sentence, UNAVAILABLE)
+
+
 class HostOpsWaitTests(unittest.TestCase):
     def run_wait(self, client, *, timeout_s=120.0, on_line=None):
         with patch.object(host_ops, "_sleep", no_sleep):

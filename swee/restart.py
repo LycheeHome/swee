@@ -9,7 +9,7 @@ import discord
 from swee.bot import bot
 from swee.config import ALERTS_CHANNEL_ID, COLOR_LEAVE, COLOR_READY, COLOR_SHUTDOWN, PALWORLD_SERVICE_NAME, RAM_RESTART_WARNING_SEC
 from swee.embeds import broadcast_embed
-from swee.host_ops import SENTENCE_UNAVAILABLE, HostOpsError, host_ops
+from swee.host_ops import SENTENCE_BUSY, HostOpsError, host_ops
 from swee.rest_client import rest
 
 log = logging.getLogger("swee")
@@ -50,15 +50,21 @@ def _failed_embed(sentence):
 
 
 async def host_control_refusal():
-    """The "Restart failed" embed to show instead of warning anyone, when
-    lychee-admin's socket does not answer; None when it does. Checked before
-    any warning so that a refusal broadcasts nothing to players. It cannot see
-    a 409 coming (a GET answers while an action runs), so restart_palworld
-    still reports one, after the warning."""
-    if await host_ops.ping():
-        return None
-    log.error("restart: host control unavailable, not warning players")
-    return _failed_embed(SENTENCE_UNAVAILABLE)
+    """The "Restart failed" embed to show instead of warning anyone, when a
+    restart would be refused; None when nothing is in the way. Checked before
+    any warning, so that a refusal broadcasts nothing to players and shows
+    its own sentence."""
+    if _bot_restart_in_progress:
+        # swee's own restart or update is in flight; lychee-admin would answer
+        # 409, so do not ask it.
+        log.error("restart refused: swee's own restart or update is still in flight")
+        return _failed_embed(SENTENCE_BUSY)
+    try:
+        await host_ops.preflight()
+    except HostOpsError as error:
+        log.error("restart refused before warning players: %s (%s)", error.sentence, error.detail)
+        return _failed_embed(error.sentence)
+    return None
 
 
 async def restart_palworld(on_progress=None):
