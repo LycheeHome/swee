@@ -1,12 +1,15 @@
-"""Tests for swee/restart.py's restart_palworld(). As in test_server_update.py,
-asyncio.create_subprocess_exec is mocked throughout, so this verifies only the
-Python-level control flow — the real sudo grant and systemctl's actual exit
-codes are unverified here and can only be checked on the host.
+"""Tests for swee/restart.py: /restart and the RAM auto-restart go through
+lychee-admin's host-operations socket (swee/host_ops.py), never sudo. The
+host_ops singleton is patched throughout, so this verifies swee's control
+flow; the socket itself is covered by tests/test_host_ops.py and the real
+grant can only be checked on the host.
 """
 import asyncio
 import os
+import subprocess
 import unittest
-from unittest.mock import AsyncMock, patch
+from datetime import datetime, timezone
+from unittest.mock import AsyncMock, MagicMock, patch
 
 os.environ.setdefault("DISCORD_BOT_TOKEN", "x")
 os.environ.setdefault("GUILD_ID", "1")
@@ -24,43 +27,209 @@ os.environ.setdefault("REST_USER", "x")
 os.environ.setdefault("REST_PASSWORD", "x")
 os.environ.setdefault("PALWORLD_SETTINGS_INI_PATH", "/tmp/x")
 
+import main
+import swee.commands as commands
 import swee.restart as restart
+from swee.host_ops import ActionState, HostOpsError
+
+BUSY = "an action is already running on the server"
+UNAVAILABLE = "host control is unavailable right now"
+SOCKET = "/run/lychee-admin/clients/swee/api.sock"
+NOW = datetime(2026, 10, 14, 18, 0, 0, tzinfo=timezone.utc)
 
 
-class FakeProc:
-    """Stands in for the process object asyncio.create_subprocess_exec returns."""
+def state(name, log_tail=""):
+    return ActionState(state=name, started_at=NOW, finished_at=None, log_tail=log_tail)
 
-    def __init__(self, returncode):
-        self.returncode = returncode
 
-    async def wait(self):
-        return self.returncode
+class FakeClock:
+    """Stands in for restart._now / restart._sleep: sleeping advances time."""
+
+    def __init__(self):
+        self.t = 0.0
+
+    def now(self):
+        return self.t
+
+    async def sleep(self, seconds):
+        self.t += seconds
+
+
+def fake_host_ops(start=None, wait=None, ping=True):
+    ops = MagicMock()
+    ops.socket_path = SOCKET
+    if isinstance(start, Exception):
+        ops.start = AsyncMock(side_effect=start)
+    else:
+        ops.start = AsyncMock(return_value=start or state("running"))
+    ops.wait = AsyncMock(return_value=wait or state("succeeded"))
+    ops.ping = AsyncMock(return_value=ping)
+    return ops
 
 
 class RestartPalworldTests(unittest.TestCase):
-    def test_failed_restart_aborts_before_the_poll(self):
-        """Mirrors test_server_update.py's failed-stop test: a `systemctl
-        restart` that fails must not be followed by the online poll, which
-        would otherwise report on whatever state the server already
-        happened to be in rather than on the restart that was never
-        issued — the original /update bug, verbatim, in /restart."""
+    def run_restart(self, ops, info=None):
+        clock = FakeClock()
+        info = info or AsyncMock()
+        broadcast = AsyncMock()
+        announce = AsyncMock()
+        with patch.object(restart, "host_ops", ops), \
+             patch.object(restart.rest, "info", info), \
+             patch.object(restart.rest, "announce", announce), \
+             patch.object(restart, "broadcast_embed", broadcast), \
+             patch.object(restart, "_now", clock.now), \
+             patch.object(restart, "_sleep", clock.sleep):
+            embed = asyncio.run(restart.restart_palworld())
+        return embed, broadcast, announce, info
 
-        async def fake_exec(*args, **kwargs):
-            return FakeProc(1)
+    def test_restart_succeeds_then_waits_for_rest(self):
+        ops = fake_host_ops()
+        embed, _, _, info = self.run_restart(ops)
 
-        info_mock = AsyncMock()
-        with patch.object(restart.rest, "info", info_mock), \
-             patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
-            with self.assertLogs("swee", level="ERROR") as logs:
-                embed = asyncio.run(restart.restart_palworld())
+        self.assertEqual(embed.title, "Server restarted")
+        ops.start.assert_awaited_once_with("restart")
+        args, kwargs = ops.wait.call_args
+        self.assertEqual(args[0], "restart")
+        posted_at = args[1] if len(args) > 1 else kwargs["posted_at"]
+        self.assertIsNotNone(posted_at.tzinfo, "posted_at must be timezone-aware")
+        timeout = args[2] if len(args) > 2 else kwargs["timeout_s"]
+        self.assertEqual(timeout, 300)
+        info.assert_awaited()
 
-        info_mock.assert_not_called()
+    def test_restart_failed_shows_log_tail(self):
+        ops = fake_host_ops(wait=state("failed", "Job for palworld-palchuds.service failed\nboom"))
+        with self.assertLogs("swee", level="ERROR"):
+            embed, _, _, info = self.run_restart(ops)
+
         self.assertEqual(embed.title, "Restart failed")
-        self.assertIn("exit 1", embed.fields[0].value)
-        self.assertTrue(
-            any("restart failed" in message for message in logs.output),
-            f"expected a logged restart failure, got: {logs.output}",
-        )
+        self.assertTrue(any("boom" in field.value for field in embed.fields), embed.fields)
+        # A failed restart is never followed by the online poll, which would
+        # report on whatever state the server was already in ("back online
+        # after 0s" having restarted nothing).
+        info.assert_not_called()
+
+    def test_restart_busy_broadcasts_nothing(self):
+        ops = fake_host_ops(start=HostOpsError(BUSY, 'HTTP 409: {"error": "busy"}', 409))
+        with self.assertLogs("swee", level="ERROR") as logs:
+            embed, broadcast, announce, info = self.run_restart(ops)
+
+        self.assertEqual(embed.title, "Restart failed")
+        self.assertEqual(embed.fields[0].value, BUSY)
+        broadcast.assert_not_called()
+        announce.assert_not_called()
+        info.assert_not_called()
+        ops.wait.assert_not_called()
+        self.assertTrue(any("HTTP 409" in line for line in logs.output), logs.output)
+
+    def test_restart_unreachable(self):
+        ops = fake_host_ops(start=HostOpsError(UNAVAILABLE, "ConnectError: refused"))
+        with self.assertLogs("swee", level="ERROR"):
+            embed, broadcast, announce, _ = self.run_restart(ops)
+
+        self.assertEqual(embed.title, "Restart failed")
+        self.assertEqual(embed.fields[0].value, UNAVAILABLE)
+        broadcast.assert_not_called()
+        announce.assert_not_called()
+
+    def test_wait_timeout_is_reported_with_its_sentence(self):
+        ops = fake_host_ops()
+        ops.wait = AsyncMock(side_effect=HostOpsError(UNAVAILABLE, "no result for restart after 300s"))
+        with self.assertLogs("swee", level="ERROR"):
+            embed, _, _, info = self.run_restart(ops)
+
+        self.assertEqual(embed.title, "Restart failed")
+        self.assertEqual(embed.fields[0].value, UNAVAILABLE)
+        info.assert_not_called()
+
+    def test_succeeded_but_rest_silent_times_out(self):
+        ops = fake_host_ops()
+        info = AsyncMock(side_effect=ConnectionError("down"))
+        embed, _, _, _ = self.run_restart(ops, info=info)
+
+        self.assertEqual(embed.title, "Restart timed out")
+        self.assertIn("120s", embed.fields[0].value)
+
+
+class CheckPalworldServiceTests(unittest.TestCase):
+    def check(self, load_state):
+        result = subprocess.CompletedProcess([], 0, stdout=f"{load_state}\n", stderr="")
+        with patch.object(restart.subprocess, "run", return_value=result) as run:
+            ok = restart.check_palworld_service()
+        return ok, run
+
+    def test_check_palworld_service_needs_no_sudo(self):
+        ok, run = self.check("loaded")
+        self.assertTrue(ok)
+        run.assert_called_once()
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[:2], ["systemctl", "show"])
+        self.assertNotIn("sudo", argv)
+
+        with self.assertLogs("swee", level="ERROR"):
+            ok, _ = self.check("not-found")
+        self.assertFalse(ok)
+
+
+class RefusedBeforeWarningTests(unittest.TestCase):
+    """A refusal broadcasts nothing to players: when host control is down,
+    neither /restart nor the RAM auto-restart warns anyone first."""
+
+    def test_restart_command_refused_before_anything_is_announced(self):
+        ops = fake_host_ops(ping=False)
+        interaction = MagicMock()
+        interaction.response.send_message = AsyncMock()
+        interaction.edit_original_response = AsyncMock()
+        warn = AsyncMock()
+        with patch.object(restart, "host_ops", ops), \
+             patch.object(commands, "warn_and_wait", warn):
+            with self.assertLogs("swee", level="ERROR"):
+                asyncio.run(commands.restart.callback(interaction))
+
+        warn.assert_not_called()
+        ops.start.assert_not_called()
+        final = interaction.edit_original_response.call_args.kwargs["embed"]
+        self.assertEqual(final.title, "Restart failed")
+        self.assertEqual(final.fields[0].value, UNAVAILABLE)
+        self.assertFalse(restart._bot_restart_in_progress)
+
+    def test_auto_restart_refused_before_warning(self):
+        ops = fake_host_ops(ping=False)
+        warn = AsyncMock()
+        channel = MagicMock(spec=restart.discord.TextChannel)
+        channel.send = AsyncMock()
+        with patch.object(restart, "host_ops", ops), \
+             patch.object(restart, "warn_and_wait", warn), \
+             patch.object(restart.bot, "get_channel", return_value=channel):
+            with self.assertLogs("swee", level="ERROR"):
+                asyncio.run(restart.auto_restart_sequence(95))
+
+        warn.assert_not_called()
+        ops.start.assert_not_called()
+        sent = channel.send.call_args.kwargs["embed"]
+        self.assertEqual(sent.title, "Restart failed")
+        self.assertEqual(sent.fields[0].value, UNAVAILABLE)
+
+
+class StartupTests(unittest.TestCase):
+    def test_startup_does_not_exit_when_socket_down(self):
+        ops = fake_host_ops(ping=False)
+        start = AsyncMock()
+        with patch.object(main, "host_ops", ops), \
+             patch.object(main, "check_palworld_service", return_value=True), \
+             patch.object(main, "load_player_history"), \
+             patch.object(main, "load_session_state"), \
+             patch.object(main, "load_last_release"), \
+             patch.object(main, "load_last_event_id"), \
+             patch.object(main, "load_last_palworld_settings"), \
+             patch.object(main.discord.utils, "setup_logging"), \
+             patch.object(main.bot, "start", start), \
+             patch.object(main.rest.client, "aclose", AsyncMock()):
+            with self.assertLogs("swee", level="INFO") as logs:
+                asyncio.run(main.main())  # no SystemExit
+
+        ops.ping.assert_awaited_once()
+        start.assert_awaited_once()
+        self.assertTrue(any(SOCKET in line for line in logs.output), logs.output)
 
 
 if __name__ == "__main__":
