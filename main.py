@@ -8,6 +8,7 @@ import swee.config_commands  # noqa: F401 — registers slash commands via decor
 from swee.bot import bot
 from swee.cause_detection import load_last_palworld_settings
 from swee.config import BOT_TOKEN, GITHUB_REPO, GUILD_ID, PALFEED_SERVICE_URL, RELAY_CHANNEL_ID
+from swee.host_ops import host_ops
 from swee.log_tailer import log_tailer
 from swee.palfeed import load_last_event_id, palfeed_ticker
 from swee.player_history import load_player_history, load_session_state
@@ -56,6 +57,16 @@ async def main():
     discord.utils.setup_logging()
     if not check_palworld_service():
         raise SystemExit(1)
+    # Logged, never fatal: lychee-admin restarts on every one of its deploys,
+    # and swee must not crash-loop through them. /restart and /update report
+    # "host control is unavailable right now" while it is down.
+    if await host_ops.ping():
+        log.info("host-ops socket %s answered", host_ops.socket_path)
+    else:
+        log.warning(
+            "host-ops socket %s did not answer — /restart, /update and the RAM auto-restart "
+            "will be refused until it does", host_ops.socket_path,
+        )
     load_player_history()
     load_session_state()
     load_last_release()

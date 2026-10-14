@@ -41,13 +41,12 @@ age out of rollback range.
 ### Deploying this bot somewhere else
 
 `deploy/setup.sh` remains the standalone install path and is unaffected by any of the above — it
-creates the venv, installs dependencies, checks the Palworld service exists, installs the
-passwordless-sudo rule `/restart` needs, and installs `swee.service`. It sets up a host; it does
-not wire up continuous deployment, and there is no longer anything in this repo that does.
-`/update`'s three additional grants (`systemctl stop`/`start` plus the host-side update wrapper)
-are not part of that install — the wrapper in particular is `lychee-ops`' artifact — so see the
-README's "Running" section for what a host needs beyond this script before `/update` can do
-anything.
+creates the venv, installs dependencies, checks the Palworld service exists, and installs
+`swee.service`. It sets up a host; it does not wire up continuous deployment, and there is no
+longer anything in this repo that does. It installs no sudo grant, because swee needs none:
+`/restart`, `/update` and the RAM auto-restart reach the game server's unit through lychee-admin's
+host-operations socket (`HOST_OPS_SOCKET`), which requires the bot's user to be in the `swee-api`
+group. On `lychee`, `lychee-ops` declares that group membership and the socket's grant.
 
 ## Versioning
 

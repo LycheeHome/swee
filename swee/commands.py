@@ -10,7 +10,7 @@ from swee.config import COLOR_CHAT, COLOR_SHUTDOWN, OFFLINE_PLAYERS_LIMIT, RAM_R
 from swee.embeds import add_status_fields, format_offline_field, format_online_field, offline_entries_from_history
 from swee.player_history import online_players, player_history, refresh_online_players, session_started
 from swee.rest_client import rest
-from swee.restart import restart_palworld, warn_and_wait
+from swee.restart import host_control_refusal, restart_palworld, warn_and_wait
 from swee.server_update import update_palworld
 
 log = logging.getLogger("swee")
@@ -134,8 +134,19 @@ async def restart(interaction: discord.Interaction):
         title="Restarting Palworld server",
         color=COLOR_SHUTDOWN,
     )
-    embed.add_field(name="Status", value="Broadcasting restart warning…")
+    embed.add_field(name="Status", value="Checking host control…")
     await interaction.response.send_message(embed=embed)
+
+    # A refusal broadcasts nothing to players: check that lychee-admin would
+    # accept a restart (reachable, allowed, nothing running) before warning
+    # anyone that the server is about to restart.
+    refusal = await host_control_refusal()
+    if refusal is not None:
+        await _deliver_result(interaction, refusal)
+        return
+
+    embed.set_field_at(0, name="Status", value="Broadcasting restart warning…")
+    await _try_edit(interaction, embed)
 
     await warn_and_wait(
         "Restarting server",
@@ -165,7 +176,7 @@ async def update(interaction: discord.Interaction):
         title="Updating Palworld server",
         color=COLOR_SHUTDOWN,
     )
-    embed.add_field(name="Status", value="Broadcasting update warning…")
+    embed.add_field(name="Status", value="Checking host control…")
     await interaction.response.send_message(embed=embed)
 
     async def on_progress(status):

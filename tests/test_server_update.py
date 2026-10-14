@@ -1,13 +1,14 @@
-"""Tests for swee/server_update.py's update_palworld(). asyncio.create_
-subprocess_exec is mocked throughout via FakeProc below, so what's verified
-here is the Python-level control flow only — the real sudo grants, the
-update wrapper, and steamcmd's actual exit codes are unverified by this
-suite and can only be checked on the host.
+"""Tests for swee/server_update.py: /update goes through lychee-admin's
+host-operations socket (swee/host_ops.py), never sudo. The host_ops singleton
+is patched throughout, so this verifies swee's control flow; the socket itself
+is covered by tests/test_host_ops.py, and lychee-ops' update script (stop,
+steamcmd, start) can only be checked on the host.
 """
 import asyncio
 import os
 import unittest
-from unittest.mock import AsyncMock, patch
+from datetime import datetime, timezone
+from unittest.mock import AsyncMock, MagicMock, patch
 
 os.environ.setdefault("DISCORD_BOT_TOKEN", "x")
 os.environ.setdefault("GUILD_ID", "1")
@@ -25,184 +26,264 @@ os.environ.setdefault("REST_USER", "x")
 os.environ.setdefault("REST_PASSWORD", "x")
 os.environ.setdefault("PALWORLD_SETTINGS_INI_PATH", "/tmp/x")
 
+import swee.restart as restart
 import swee.server_update as server_update
+from swee.host_ops import ActionState, HostOpsError
+
+BUSY = "an action is already running on the server"
+UNAVAILABLE = "host control is unavailable right now"
+NOT_ALLOWED = "swee is not allowed to do that"
+NOW = datetime(2026, 10, 14, 18, 0, 0, tzinfo=timezone.utc)
+PROGRESS_LINE = "Update state (0x61) downloading, progress: 64.31"
 
 
-class FakeProc:
-    """Stands in for the process object asyncio.create_subprocess_exec returns."""
+def steamcmd_tail(marker):
+    """A realistic update log: a long run of steamcmd progress lines (which
+    never name steamcmd), then the script's outcome line, if any."""
+    lines = [
+        "Redirecting stderr to '/home/steam/.local/share/Steam/logs/stderr.txt'",
+        "Steam Console Client (c) Valve Corporation - version 1727119040",
+        "Loading Steam API...OK",
+        "Connecting anonymously to Steam Public...OK",
+    ]
+    lines += [
+        f" Update state (0x61) downloading, progress: {i * 0.37:.2f} ({i * 25165824} / 6800000000)"
+        for i in range(1, 121)
+    ]
+    lines.append("Error! App '2394010' state is 0x202 after update job.")
+    if marker is not None:
+        lines.append(marker)
+    return "\n".join(lines)
 
-    def __init__(self, returncode, output=b"", stderr=b""):
-        self.returncode = returncode
-        self._output = output
-        self._stderr = stderr
 
-    async def wait(self):
-        return self.returncode
-
-    async def communicate(self):
-        return self._output, self._stderr
+def state(name, log_tail=""):
+    return ActionState(state=name, started_at=NOW, finished_at=None, log_tail=log_tail)
 
 
-def _is_preflight_call(args):
-    """True for one of _missing_sudo_grant()'s `sudo -n -l <cmd>` checks,
-    as opposed to a real `sudo <cmd>` invocation. Needed because the real
-    wrapper call (`sudo`, SWEE_UPDATE_WRAPPER) and the preflight's check of
-    that same grant (`sudo`, `-n`, `-l`, SWEE_UPDATE_WRAPPER) both contain
-    the wrapper path — only the argument shape tells them apart."""
-    return "-n" in args and "-l" in args
+class FakeClock:
+    """Stands in for server_update._now / _sleep: sleeping advances time."""
+
+    def __init__(self):
+        self.t = 0.0
+
+    def now(self):
+        return self.t
+
+    async def sleep(self, seconds):
+        self.t += seconds
+
+
+def fake_host_ops(start=None, wait=None, preflight=None):
+    ops = MagicMock()
+    ops.preflight = AsyncMock(side_effect=preflight)
+    if isinstance(start, Exception):
+        ops.start = AsyncMock(side_effect=start)
+    else:
+        ops.start = AsyncMock(return_value=start or state("running"))
+    if isinstance(wait, Exception):
+        ops.wait = AsyncMock(side_effect=wait)
+    else:
+        ops.wait = AsyncMock(return_value=wait or state("succeeded"))
+    ops.ping = AsyncMock(return_value=True)
+    return ops
 
 
 class UpdatePalworldTests(unittest.TestCase):
-    def setUp(self):
-        # Every path through update_palworld() broadcasts a warning and
-        # saves the world before it ever touches the service — neither is
-        # under test here, so both are stubbed out.
-        self.warn_and_wait_mock = AsyncMock()
-        self._patch(server_update, "warn_and_wait", self.warn_and_wait_mock)
-        self._patch(server_update.rest, "save", AsyncMock())
-        self._patch(server_update.rest, "info", AsyncMock())
+    def run_update(self, ops, info=None, on_progress=None):
+        clock = FakeClock()
+        self.info = info or AsyncMock()
+        self.warn = AsyncMock()
+        self.broadcast = AsyncMock()
+        self.announce = AsyncMock()
+        self.save = AsyncMock()
+        # restart.host_control_refusal() reads restart's host_ops; the update
+        # itself reads server_update's. Both are the same singleton in the bot.
+        with patch.object(restart, "host_ops", ops), \
+             patch.object(server_update, "host_ops", ops), \
+             patch.object(server_update, "warn_and_wait", self.warn), \
+             patch.object(server_update, "broadcast_embed", self.broadcast), \
+             patch.object(server_update.rest, "info", self.info), \
+             patch.object(server_update.rest, "announce", self.announce), \
+             patch.object(server_update.rest, "save", self.save), \
+             patch.object(server_update, "_now", clock.now), \
+             patch.object(server_update, "_sleep", clock.sleep):
+            embed = asyncio.run(server_update.update_palworld(on_progress))
+        # A leaked True would make log_tailer treat every future unplanned
+        # shutdown as a planned one, permanently.
+        self.assertFalse(restart._bot_restart_in_progress)
+        return embed
 
-    def _patch(self, target, attr, value):
-        patcher = patch.object(target, attr, value)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+    def test_update_progress_shows_latest_log_line(self):
+        ops = fake_host_ops()
 
-    def test_failed_stop_aborts_before_the_wrapper_runs(self):
-        """This is the whole point of the task: a stop that fails must not
-        be followed by the update wrapper running its `steamcmd +app_update
-        validate` against a server that never went down."""
-        calls = []
+        async def fake_wait(action, posted_at, timeout_s, on_line=None):
+            await on_line(PROGRESS_LINE)
+            return state("succeeded", PROGRESS_LINE)
 
-        async def fake_exec(*args, **kwargs):
-            calls.append(args)
-            if _is_preflight_call(args):
-                return FakeProc(0)  # all three grants present
-            if "stop" in args:
-                return FakeProc(1)
-            return FakeProc(0, b"ok")
+        ops.wait = AsyncMock(side_effect=fake_wait)
+        progress = AsyncMock()
+        self.run_update(ops, on_progress=progress)
 
-        with patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
-            embed = asyncio.run(server_update.update_palworld())
+        messages = [call.args[0] for call in progress.await_args_list]
+        self.assertTrue(any(PROGRESS_LINE in message for message in messages), messages)
 
-        wrapper_run = ("sudo", server_update.SWEE_UPDATE_WRAPPER)
-        self.assertNotIn(wrapper_run, calls, "the update wrapper ran after a failed stop")
-        self.assertEqual(embed.title, "Update failed")
-        self.assertIn("not restarted", embed.fields[0].value)
-        # A leaked True here would make log_tailer.py treat every future
-        # unplanned shutdown as a planned one, permanently, with no test
-        # failing — see swee/log_tailer.py:126.
-        self.assertFalse(server_update.restart_module._bot_restart_in_progress)
+    def test_update_succeeds_then_waits_for_rest(self):
+        ops = fake_host_ops()
+        embed = self.run_update(ops)
 
-    def test_successful_flow_invokes_the_wrapper_not_steamcmd_directly(self):
-        calls = []
-
-        async def fake_exec(*args, **kwargs):
-            calls.append(args)
-            if _is_preflight_call(args):
-                return FakeProc(0)
-            return FakeProc(0, b"Success! App '2394010' fully installed.")
-
-        with patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
-            embed = asyncio.run(server_update.update_palworld())
-
-        # Exact-tuple, not substring: the sudoers entry pins the wrapper to
-        # zero arguments, so a call that appended one would still contain
-        # the wrapper path as a substring but would break /update for real.
-        self.assertIn(("sudo", server_update.SWEE_UPDATE_WRAPPER), calls)
-        self.assertFalse(
-            any("steamcmd" in " ".join(c) for c in calls),
-            "steamcmd was invoked directly instead of through the wrapper",
-        )
         self.assertEqual(embed.title, "Server updated")
+        ops.start.assert_awaited_once_with("update")
+        self.assertEqual(ops.wait.call_args.args[0], "update")
+        posted_at = ops.wait.call_args.args[1]
+        self.assertIsNotNone(posted_at.tzinfo, "posted_at must be timezone-aware")
+        self.warn.assert_awaited_once()
+        self.save.assert_awaited_once()
+        self.info.assert_awaited()
 
-    def test_failed_start_is_logged_but_does_not_abort(self):
-        async def fake_exec(*args, **kwargs):
-            if _is_preflight_call(args):
-                return FakeProc(0)
-            if "start" in args:
-                return FakeProc(1)
-            return FakeProc(0, b"Success! App '2394010' fully installed.")
+    def test_update_succeeded_but_rest_silent_times_out(self):
+        ops = fake_host_ops()
+        embed = self.run_update(ops, info=AsyncMock(side_effect=ConnectionError("down")))
+        self.assertEqual(embed.title, "Update timed out")
+        self.assertIn("120s", embed.fields[0].value)
 
-        with patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
-            with self.assertLogs("swee", level="ERROR") as logs:
-                embed = asyncio.run(server_update.update_palworld())
+    def run_failed(self, tail, info=None):
+        ops = fake_host_ops(wait=state("failed", tail))
+        with self.assertLogs("swee", level="ERROR"):
+            embed = self.run_update(ops, info=info)
+        self.assertEqual(embed.title, "Update failed")
+        return embed
 
-        self.assertTrue(
-            any("start failed" in message for message in logs.output),
-            f"expected a logged start failure, got: {logs.output}",
+    def assert_not_retracted(self):
+        self.broadcast.assert_not_called()
+        self.announce.assert_not_called()
+
+    def test_update_failed_shows_last_500_chars(self):
+        tail = steamcmd_tail("lychee-op-update: update failed (exit 8); start exit 0")
+        embed = self.run_failed(tail)
+
+        self.assertEqual(embed.fields[0].value, "```…" + tail[-500:] + "```")
+        self.assertEqual(embed.fields[1].value, "Server was still restarted with the existing install.")
+        self.assert_not_retracted()
+        self.info.assert_not_called()
+
+    def test_update_failed_and_start_failed_says_the_restart_failed(self):
+        tail = steamcmd_tail("lychee-op-update: update failed (exit 8); start exit 1")
+        embed = self.run_failed(tail)
+
+        self.assertEqual(embed.fields[0].value, "```…" + tail[-500:] + "```")
+        self.assertIn("restart afterward also failed (exit 1)", embed.fields[1].value)
+        self.assertIn("systemctl status", embed.fields[1].value)
+        self.assert_not_retracted()
+
+    def test_update_stop_failure_retracts(self):
+        tail = steamcmd_tail(
+            "Failed to stop palworld-palchuds.service: Job timed out\n"
+            "lychee-op-update: stop failed (exit 1)"
         )
-        # Not fatal: the flow still completes and reports on the update
-        # itself rather than aborting because start's return code was bad.
-        self.assertEqual(embed.title, "Server updated")
+        embed = self.run_failed(tail)
 
-    def test_missing_grant_aborts_before_warn_and_wait(self):
-        """A missing grant is a configuration error, not a live-server
-        emergency — it must be caught before the bot ever broadcasts an
-        update warning or saves the world, not merely before the wrapper
-        runs."""
+        self.broadcast.assert_awaited_once()
+        self.assertEqual(self.broadcast.call_args.args[0], "Update aborted")
+        self.announce.assert_awaited_once()
+        self.assertIn("Update cancelled", self.announce.call_args.args[0])
+        self.assertIn("staying up", self.announce.call_args.args[0])
+        self.assertIn("never taken down", embed.fields[0].value)
+        self.assertTrue(any("Failed to stop" in field.value for field in embed.fields), embed.fields)
+        self.info.assert_not_called()
 
-        async def fake_exec(*args, **kwargs):
-            # The preflight checks systemctl-stop's grant first; fail it
-            # to simulate that grant being missing (e.g. mid-migration,
-            # the window Phase 4's narrowing is designed to be caught in).
-            return FakeProc(1)
-
-        with patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
-            embed = asyncio.run(server_update.update_palworld())
-
-        self.warn_and_wait_mock.assert_not_called()
-        self.assertEqual(embed.title, "Update failed")
-        self.assertIn("systemctl stop", embed.fields[0].value)
-
-    def test_failed_wrapper_with_successful_restart_reports_old_install_is_back(self):
-        """start_rc == 0 arm of the steamcmd_ok split (c2a824b). Neither
-        arm was reachable before: the failed-stop test above returns
-        before the wrapper ever runs, and the other two tests have the
-        wrapper exiting 0. Here the wrapper fails but the restart
-        afterward succeeds, so the embed must say the previously-installed
-        files are back up rather than leaving that ambiguous."""
-
-        async def fake_exec(*args, **kwargs):
-            if _is_preflight_call(args):
-                return FakeProc(0)
-            if args == ("sudo", server_update.SWEE_UPDATE_WRAPPER):
-                return FakeProc(8, b"Error! App '2394010' state is 0x202 after update job.")
-            return FakeProc(0)  # systemctl stop and start both succeed
-
-        with patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
-            embed = asyncio.run(server_update.update_palworld())
-
-        self.assertEqual(embed.title, "Update failed")
-        self.assertIn("state is 0x202", embed.fields[0].value)
-        self.assertIn("still restarted", embed.fields[1].value)
-
-    def test_failed_wrapper_and_failed_start_reports_compound_failure(self):
-        """The compound case named in review: the wrapper fails AND the
-        restart afterward also fails. This is the arm where the wording
-        matters most — the operator needs to know the server is down, not
-        just that the update itself failed."""
-
-        async def fake_exec(*args, **kwargs):
-            if _is_preflight_call(args):
-                return FakeProc(0)
-            if args == ("sudo", server_update.SWEE_UPDATE_WRAPPER):
-                return FakeProc(8, b"Error! App '2394010' state is 0x202 after update job.")
-            if "start" in args:
-                return FakeProc(1)
-            return FakeProc(0)  # stop succeeds
-
-        with patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
-            with self.assertLogs("swee", level="ERROR") as logs:
-                embed = asyncio.run(server_update.update_palworld())
-
-        self.assertEqual(embed.title, "Update failed")
-        self.assertIn("state is 0x202", embed.fields[0].value)
-        self.assertIn("restart afterward also failed", embed.fields[1].value)
-        self.assertIn("exit 1", embed.fields[1].value)
-        self.assertTrue(
-            any("start failed" in message for message in logs.output),
-            f"expected a logged start failure, got: {logs.output}",
+    def test_update_uses_the_last_marker_line(self):
+        """Output appended after the script's outcome (the recorder, the
+        restart guard) does not hide it, and an earlier marker-shaped line is
+        superseded by the last one."""
+        tail = steamcmd_tail(
+            "lychee-op-update: stop failed (exit 1)\n"
+            "lychee-op-update: update failed (exit 8); start exit 0\n"
+            "recorder: result written"
         )
+        embed = self.run_failed(tail)
+        self.assertEqual(embed.fields[1].value, "Server was still restarted with the existing install.")
+        self.assert_not_retracted()
+
+    def test_update_without_a_marker_is_neutral_then_waits_for_rest(self):
+        """A killed or timed-out run, or a host without the new script: no
+        claim about why, no retraction, and the status says whether the
+        server came back."""
+        embed = self.run_failed(steamcmd_tail(None))
+
+        self.assert_not_retracted()
+        self.info.assert_awaited()
+        self.assertTrue(any("back online" in field.value for field in embed.fields), embed.fields)
+        self.assertTrue(any(field.value.startswith("```") for field in embed.fields), embed.fields)
+
+    def test_update_without_a_marker_and_rest_silent(self):
+        embed = self.run_failed(steamcmd_tail(None), info=AsyncMock(side_effect=ConnectionError("down")))
+
+        self.assert_not_retracted()
+        self.assertTrue(any("not responding" in field.value for field in embed.fields), embed.fields)
+        self.assertTrue(any("120s" in field.value for field in embed.fields), embed.fields)
+
+    def test_the_word_steamcmd_decides_nothing(self):
+        """The old rule: no "steamcmd" in the tail meant a failed stop. A
+        real steamcmd tail rarely contains the word, so its absence must not
+        retract, and its presence must not claim a restart."""
+        embed = self.run_failed(steamcmd_tail(None))
+        self.assert_not_retracted()
+        embed = self.run_failed("Running steamcmd +app_update 2394010 validate\n" + steamcmd_tail(None))
+        self.assert_not_retracted()
+        self.assertFalse(any("existing install" in field.value for field in embed.fields), embed.fields)
+
+    def test_update_poll_timeout_is_35_minutes(self):
+        ops = fake_host_ops()
+        self.run_update(ops)
+        self.assertEqual(ops.wait.call_args.kwargs["timeout_s"], 35 * 60)
+
+    def test_update_wait_gives_up_reports_timeout(self):
+        ops = fake_host_ops(wait=HostOpsError(UNAVAILABLE, "no result for update after 2100s"))
+        with self.assertLogs("swee", level="ERROR"):
+            embed = self.run_update(ops)
+        self.assertEqual(embed.title, "Update timed out")
+        self.broadcast.assert_not_called()
+
+    def test_update_start_refused_after_warning_retracts(self):
+        """A POST refused after players were warned (e.g. an action started
+        between the preflight and the POST): nothing ran, so the warning is
+        retracted."""
+        ops = fake_host_ops(start=HostOpsError(BUSY, 'HTTP 409: {"error": "busy"}', 409))
+        with self.assertLogs("swee", level="ERROR"):
+            embed = self.run_update(ops)
+        self.assertEqual(embed.title, "Update failed")
+        self.assertEqual(embed.fields[0].value, BUSY)
+        self.assertEqual(self.broadcast.call_args.args[0], "Update aborted")
+        self.announce.assert_awaited_once()
+        ops.wait.assert_not_called()
+
+    def test_update_refused_before_anything_is_announced(self):
+        ops = fake_host_ops(preflight=HostOpsError(NOT_ALLOWED, 'HTTP 403: {"error": "not granted"}', 403))
+        with self.assertLogs("swee", level="ERROR") as logs:
+            embed = self.run_update(ops)
+
+        self.assertEqual(embed.title, "Update failed")
+        self.assertEqual(embed.fields[0].value, NOT_ALLOWED)
+        self.assertTrue(any("not granted" in line for line in logs.output), logs.output)
+        for mock in (self.warn, self.broadcast, self.announce, self.save, ops.start):
+            mock.assert_not_called()
+
+    def test_update_refused_while_own_action_in_flight(self):
+        ops = fake_host_ops()
+        warn = AsyncMock()
+        with patch.object(restart, "_bot_restart_in_progress", True):
+            with patch.object(restart, "host_ops", ops), \
+                 patch.object(server_update, "host_ops", ops), \
+                 patch.object(server_update, "warn_and_wait", warn):
+                with self.assertLogs("swee", level="ERROR"):
+                    embed = asyncio.run(server_update.update_palworld())
+            # The refusal must not clear the flag owned by the action in flight.
+            self.assertTrue(restart._bot_restart_in_progress)
+
+        self.assertEqual(embed.title, "Update failed")
+        self.assertEqual(embed.fields[0].value, BUSY)
+        self.assertEqual(ops.mock_calls, [], "no host_ops call while swee's own action runs")
+        warn.assert_not_called()
 
 
 if __name__ == "__main__":

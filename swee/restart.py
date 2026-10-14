@@ -2,20 +2,37 @@ import asyncio
 import logging
 import subprocess
 import time
+from datetime import datetime, timezone
 
 import discord
 
 from swee.bot import bot
 from swee.config import ALERTS_CHANNEL_ID, COLOR_LEAVE, COLOR_READY, COLOR_SHUTDOWN, PALWORLD_SERVICE_NAME, RAM_RESTART_WARNING_SEC
 from swee.embeds import broadcast_embed
+from swee.host_ops import SENTENCE_BUSY, HostOpsError, host_ops
 from swee.rest_client import rest
 
 log = logging.getLogger("swee")
 
 _bot_restart_in_progress = False  # true while a bot-initiated restart (/restart or auto) is in flight
 
+# How long to poll lychee-admin for the restart's result: the restart
+# service's TimeoutStartSec, after which systemd itself gives up on it.
+RESTART_WAIT_S = 300
+# How long to wait for the game's REST API once the restart has succeeded.
+REST_WAIT_S = 120
+LOG_TAIL_CHARS = 500
+
+# Indirections the tests patch, so they never touch the asyncio or time
+# modules every other caller shares.
+_sleep = asyncio.sleep
+_now = time.monotonic
+
 
 def check_palworld_service():
+    # Unprivileged: restarting the unit goes through lychee-admin's
+    # host-operations socket, whose availability is checked (and only logged)
+    # in main(), since lychee-admin restarts on every one of its deploys.
     load_state = subprocess.run(
         ["systemctl", "show", "-p", "LoadState", "--value", PALWORLD_SERVICE_NAME],
         capture_output=True, text=True,
@@ -23,58 +40,76 @@ def check_palworld_service():
     if load_state != "loaded":
         log.error("%s.service not found (LoadState=%s) — check the unit is installed", PALWORLD_SERVICE_NAME, load_state or "unknown")
         return False
-
-    sudo_check = subprocess.run(
-        ["sudo", "-n", "-l", "systemctl", "restart", PALWORLD_SERVICE_NAME], capture_output=True,
-    )
-    if sudo_check.returncode != 0:
-        log.error(
-            "passwordless sudo for 'systemctl restart %s' not configured for this user "
-            "— /restart and RAM auto-restart will hang", PALWORLD_SERVICE_NAME
-        )
-        return False
-
     return True
 
 
+def _failed_embed(sentence, title="Restart failed"):
+    embed = discord.Embed(title=title, color=COLOR_LEAVE)
+    embed.add_field(name="Status", value=sentence, inline=False)
+    return embed
+
+
+async def host_control_refusal(action="restart"):
+    """The "<Action> failed" embed to show instead of warning anyone, when
+    the action (`restart` or `update`) would be refused; None when nothing is
+    in the way. Checked before any warning, so that a refusal broadcasts
+    nothing to players and shows its own sentence."""
+    title = f"{action.capitalize()} failed"
+    if _bot_restart_in_progress:
+        # swee's own restart or update is in flight; lychee-admin would answer
+        # 409, so do not ask it.
+        log.error("%s refused: swee's own restart or update is still in flight", action)
+        return _failed_embed(SENTENCE_BUSY, title)
+    try:
+        await host_ops.preflight()
+    except HostOpsError as error:
+        log.error("%s refused before warning players: %s (%s)", action, error.sentence, error.detail)
+        return _failed_embed(error.sentence, title)
+    return None
+
+
 async def restart_palworld(on_progress=None):
-    proc = await asyncio.create_subprocess_exec("sudo", "systemctl", "restart", PALWORLD_SERVICE_NAME)
-    restart_rc = await proc.wait()
-    if restart_rc != 0:
-        # Same bug server_update.py's stop-failure guard exists to prevent:
-        # without this check, a failed restart left the service in whatever
-        # state it was already in, and the poll below reported on THAT state
-        # rather than on the restart. The concrete case is a server that was
-        # already UP — the poll's first rest.info() succeeds, and the embed
-        # reads "Server restarted — Back online after 0s" having restarted
-        # nothing. (A server left DOWN reports "Restart timed out", which is
-        # wrong about the cause but not a false success.) rc != 0 covers both
-        # a restart sudo refused and one systemd ran and could not complete.
-        log.error("restart: systemctl restart failed with rc=%s, aborting", restart_rc)
-        embed = discord.Embed(title="Restart failed", color=COLOR_LEAVE)
-        embed.add_field(
-            name="Status",
-            value=f"Could not restart {PALWORLD_SERVICE_NAME} (exit {restart_rc}) — check "
-                  f"`systemctl status {PALWORLD_SERVICE_NAME}` and `journalctl -u swee`.",
-            inline=False,
+    posted_at = datetime.now(timezone.utc)
+    try:
+        await host_ops.start("restart")
+        if on_progress:
+            await on_progress("Restarting the server…")
+        result = await host_ops.wait("restart", posted_at, timeout_s=RESTART_WAIT_S)
+    except HostOpsError as error:
+        log.error("restart: %s (%s)", error.sentence, error.detail)
+        return _failed_embed(error.sentence)
+
+    if result.state != "succeeded":
+        # Success requires `succeeded`: polling REST after a failed restart
+        # would report on whatever state the server was already in — a server
+        # that was already up reads "back online after 0s" having restarted
+        # nothing.
+        log.error("restart: the restart action ended %s: %s", result.state, result.log_tail)
+        embed = _failed_embed(
+            f"Could not restart {PALWORLD_SERVICE_NAME} — check "
+            f"`journalctl -u {PALWORLD_SERVICE_NAME}`."
         )
+        tail = result.log_tail.strip()
+        if tail:
+            shown = tail if len(tail) <= LOG_TAIL_CHARS else "…" + tail[-LOG_TAIL_CHARS:]
+            embed.add_field(name="Log", value=f"```\n{shown}\n```", inline=False)
         return embed
 
     if on_progress:
         await on_progress("Waiting for server to come back online…")
 
-    start = time.monotonic()
-    timeout = 120
+    start = _now()
+    timeout = REST_WAIT_S
     online = False
-    while time.monotonic() - start < timeout:
+    while _now() - start < timeout:
         try:
             await rest.info()
             online = True
             break
         except Exception:
-            await asyncio.sleep(5)
+            await _sleep(5)
 
-    elapsed = int(time.monotonic() - start)
+    elapsed = int(_now() - start)
     embed = discord.Embed(color=COLOR_READY if online else COLOR_LEAVE)
     if online:
         embed.title = "Server restarted"
@@ -106,17 +141,19 @@ async def warn_and_wait(discord_title, discord_description, ingame_message):
 async def auto_restart_sequence(pct):
     global _bot_restart_in_progress
     warning_sec = int(RAM_RESTART_WARNING_SEC)
-    await warn_and_wait(
-        "High RAM usage detected",
-        f"RAM usage at {pct}% — restarting server in {warning_sec}s.",
-        f"Server restarting in {warning_sec}s due to high memory usage",
-    )
+    embed = await host_control_refusal()
+    if embed is None:
+        await warn_and_wait(
+            "High RAM usage detected",
+            f"RAM usage at {pct}% — restarting server in {warning_sec}s.",
+            f"Server restarting in {warning_sec}s due to high memory usage",
+        )
 
-    _bot_restart_in_progress = True
-    try:
-        embed = await restart_palworld()
-    finally:
-        _bot_restart_in_progress = False
+        _bot_restart_in_progress = True
+        try:
+            embed = await restart_palworld()
+        finally:
+            _bot_restart_in_progress = False
 
     channel = bot.get_channel(ALERTS_CHANNEL_ID)
     if isinstance(channel, discord.TextChannel):
