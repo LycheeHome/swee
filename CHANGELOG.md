@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.12.0](https://github.com/LycheeHome/swee/compare/v2.11.4...v2.12.0) (2026-10-14)
+
+
+### Features
+
+* operate the game server through lychee-admin instead of sudo ([#75](https://github.com/LycheeHome/swee/issues/75)) ([c99d636](https://github.com/LycheeHome/swee/commit/c99d6367a4e1d20f49801604b6897a92453955c6))
+
 ## [2.11.4](https://github.com/LycheeHome/swee/compare/v2.11.3...v2.11.4) (2026-10-01)
 
 
