@@ -163,9 +163,9 @@ host-operations socket (`HOST_OPS_SOCKET`), so the user running the bot needs th
 For a Linux host you set up once and leave running, `deploy/setup.sh` automates the steps above
 plus the systemd wiring: it creates the venv, installs dependencies, copies `.env.example` to
 `.env` (without overwriting an existing one), checks that the configured Palworld service exists,
-installs a passwordless-sudo rule scoped to restarting it, and installs/enables a `swee.service`
-unit (rendered from `deploy/swee.service`). It's safe to re-run — it skips any step that's already
-in the desired state.
+and installs/enables a `swee.service` unit (rendered from `deploy/swee.service`). It's safe to re-run — it skips any step that's already
+in the desired state. It installs no sudo grant: swee reaches host control through lychee-admin's
+socket and needs the `swee-api` group.
 
 ```
 git clone <repo> && cd swee

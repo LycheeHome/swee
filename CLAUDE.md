@@ -23,8 +23,10 @@ concern). See `README.md` for architecture and setup details.
   catch-tier scoring, `cpu.py`, `player_history.py`, release-notes humanizing, the assistant's
   tool-calling logic) plus `server_update.py` and `restart.py` — both of which import real swee
   internals (`config`, `rest_client`, `restart`/`bot`) and assert on `discord.Embed` output, with
-  `asyncio.create_subprocess_exec` mocked throughout so the sudo grants, the update wrapper, and
-  systemctl's real exit codes are only verified on the host. Run with
+  the `host_ops` client (`swee/host_ops.py`, lychee-admin's host-operations socket) mocked
+  throughout, so lychee-admin's grant and lychee-ops' restart/update scripts are only verified on
+  the host; `tests/test_host_ops.py` covers the client itself and `tests/test_no_sudo.py` keeps
+  `sudo` out of swee. Run with
   `python -m unittest discover tests -v`. Still no test harness for the slash-command layer in
   `commands.py` itself — verify those manually.
 - The bot assumes it runs on the same Linux host as the Palworld server (it shells out to

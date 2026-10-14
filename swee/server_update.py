@@ -5,6 +5,7 @@ steamcmd and starts it again; swee warns players, saves the world, starts
 the action and reports on it."""
 import asyncio
 import logging
+import re
 import time
 from datetime import datetime, timezone
 
@@ -22,6 +23,14 @@ log = logging.getLogger("swee")
 # How long to poll lychee-admin for the update's result: the update service's
 # TimeoutStartSec=1800 plus slack.
 UPDATE_WAIT_S = 35 * 60
+
+# lychee-ops' update script ends its log with exactly one outcome line:
+#   lychee-op-update: stop failed (exit N)
+#   lychee-op-update: update failed (exit N); start exit M
+#   lychee-op-update: done
+_MARKER = "lychee-op-update: "
+_STOP_FAILED = re.compile(r"stop failed \(exit (\d+)\)")
+_UPDATE_FAILED = re.compile(r"update failed \(exit (\d+)\); start exit (\d+)")
 
 # Indirections the tests patch, so they never touch the asyncio or time
 # modules every other caller shares.
@@ -63,6 +72,86 @@ async def _retract():
         )
     except Exception:
         log.warning("server update: in-game retraction failed", exc_info=True)
+
+
+def _outcome(log_tail):
+    """The last `lychee-op-update: ` line lychee-ops' update script wrote,
+    parsed: ("stop", N), ("update", N, M), ("done",), or None when there is
+    none (a killed or timed-out run, or a host without that script yet).
+    The last such line, not the last line: the recorder and the restart
+    guard can append output after it."""
+    for line in reversed(log_tail.splitlines()):
+        line = line.strip()
+        if not line.startswith(_MARKER):
+            continue
+        rest_of_line = line[len(_MARKER):]
+        if match := _STOP_FAILED.fullmatch(rest_of_line):
+            return ("stop", int(match[1]))
+        if match := _UPDATE_FAILED.fullmatch(rest_of_line):
+            return ("update", int(match[1]), int(match[2]))
+        if rest_of_line == "done":
+            return ("done",)
+        return None
+    return None
+
+
+async def _wait_for_rest():
+    start = _now()
+    while _now() - start < REST_WAIT_S:
+        try:
+            await rest.info()
+            return True
+        except Exception:
+            await _sleep(5)
+    return False
+
+
+async def _report_failure(log_tail, on_progress):
+    log.error("server update: the update action failed: %s", log_tail)
+    tail = _shown_tail(log_tail)
+    shown = f"```{tail}```" if tail else "(no output)"
+    outcome = _outcome(log_tail)
+
+    if outcome is not None and outcome[0] == "stop":
+        # The stop failed, so the server was never taken down and nothing
+        # was updated: retract the warning players saw.
+        await _retract()
+        embed = _failed_embed(
+            f"Could not stop {PALWORLD_SERVICE_NAME} (exit {outcome[1]}). Nothing was updated "
+            "and the server was never taken down, so it was not restarted."
+        )
+        if tail:
+            embed.add_field(name="Log", value=shown, inline=False)
+        return embed
+
+    if outcome is not None and outcome[0] == "update":
+        embed = _failed_embed(shown, name="Update log")
+        start_exit = outcome[2]
+        if start_exit == 0:
+            status = "Server was still restarted with the existing install."
+        else:
+            status = (
+                f"The update failed (exit {outcome[1]}) and the restart afterward also failed "
+                f"(exit {start_exit}) — the server is down. Check `systemctl status {PALWORLD_SERVICE_NAME}`."
+            )
+        embed.add_field(name="Status", value=status, inline=False)
+        return embed
+
+    # No outcome line: the run was killed, timed out, or refused before the
+    # script ran. Make no claim about why and retract nothing; say only
+    # whether the server is answering.
+    embed = _failed_embed(shown, name="Update log")
+    if on_progress:
+        await on_progress("Update did not finish; waiting for the server to answer…")
+    if await _wait_for_rest():
+        status = "The update did not finish. The server is back online."
+    else:
+        status = (
+            f"The update did not finish, and the server is not responding after {REST_WAIT_S}s — "
+            f"check `systemctl status {PALWORLD_SERVICE_NAME}`."
+        )
+    embed.add_field(name="Status", value=status, inline=False)
+    return embed
 
 
 async def update_palworld(on_progress=None):
@@ -135,40 +224,11 @@ async def _run_update(on_progress):
         return _failed_embed(error.sentence)
 
     if result.state != "succeeded":
-        log.error("server update: the update action ended %s: %s", result.state, result.log_tail)
-        tail = _shown_tail(result.log_tail)
-        if "steamcmd" in result.log_tail.lower():
-            # steamcmd ran and failed; lychee-ops' update script has already
-            # started the server again with the existing install.
-            embed = _failed_embed(f"```{tail}```" if tail else "(no output)", name="steamcmd output")
-            embed.add_field(
-                name="Status",
-                value="Server was still restarted with the existing install.",
-                inline=False,
-            )
-            return embed
-        # The log never reached steamcmd: the stop failed, so the server was
-        # never taken down and nothing was updated.
-        await _retract()
-        embed = _failed_embed(
-            f"Could not stop {PALWORLD_SERVICE_NAME}. Nothing was updated and the server was "
-            f"not restarted — check `systemctl status {PALWORLD_SERVICE_NAME}`."
-        )
-        if tail:
-            embed.add_field(name="Log", value=f"```\n{tail}\n```", inline=False)
-        return embed
+        return await _report_failure(result.log_tail, on_progress)
 
     if on_progress:
         await on_progress("Waiting for server to come back online…")
-    start = _now()
-    online = False
-    while _now() - start < REST_WAIT_S:
-        try:
-            await rest.info()
-            online = True
-            break
-        except Exception:
-            await _sleep(5)
+    online = await _wait_for_rest()
 
     if not online:
         embed = discord.Embed(title="Update timed out", color=COLOR_LEAVE)

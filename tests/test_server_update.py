@@ -37,6 +37,25 @@ NOW = datetime(2026, 10, 14, 18, 0, 0, tzinfo=timezone.utc)
 PROGRESS_LINE = "Update state (0x61) downloading, progress: 64.31"
 
 
+def steamcmd_tail(marker):
+    """A realistic update log: a long run of steamcmd progress lines (which
+    never name steamcmd), then the script's outcome line, if any."""
+    lines = [
+        "Redirecting stderr to '/home/steam/.local/share/Steam/logs/stderr.txt'",
+        "Steam Console Client (c) Valve Corporation - version 1727119040",
+        "Loading Steam API...OK",
+        "Connecting anonymously to Steam Public...OK",
+    ]
+    lines += [
+        f" Update state (0x61) downloading, progress: {i * 0.37:.2f} ({i * 25165824} / 6800000000)"
+        for i in range(1, 121)
+    ]
+    lines.append("Error! App '2394010' state is 0x202 after update job.")
+    if marker is not None:
+        lines.append(marker)
+    return "\n".join(lines)
+
+
 def state(name, log_tail=""):
     return ActionState(state=name, started_at=NOW, finished_at=None, log_tail=log_tail)
 
@@ -127,32 +146,91 @@ class UpdatePalworldTests(unittest.TestCase):
         self.assertEqual(embed.title, "Update timed out")
         self.assertIn("120s", embed.fields[0].value)
 
-    def test_update_failed_shows_last_500_chars(self):
-        tail = "Running steamcmd +app_update 2394010 validate\n" + "x" * 700
+    def run_failed(self, tail, info=None):
         ops = fake_host_ops(wait=state("failed", tail))
         with self.assertLogs("swee", level="ERROR"):
-            embed = self.run_update(ops)
-
+            embed = self.run_update(ops, info=info)
         self.assertEqual(embed.title, "Update failed")
-        self.assertEqual(embed.fields[0].value, "```…" + tail[-500:] + "```")
-        self.assertIn("restarted with the existing install", embed.fields[1].value)
+        return embed
+
+    def assert_not_retracted(self):
         self.broadcast.assert_not_called()
         self.announce.assert_not_called()
 
-    def test_update_stop_failure_retracts(self):
-        ops = fake_host_ops(wait=state("failed", "Failed to stop palworld-palchuds.service: timed out"))
-        with self.assertLogs("swee", level="ERROR"):
-            embed = self.run_update(ops)
+    def test_update_failed_shows_last_500_chars(self):
+        tail = steamcmd_tail("lychee-op-update: update failed (exit 8); start exit 0")
+        embed = self.run_failed(tail)
 
-        self.assertEqual(embed.title, "Update failed")
+        self.assertEqual(embed.fields[0].value, "```…" + tail[-500:] + "```")
+        self.assertEqual(embed.fields[1].value, "Server was still restarted with the existing install.")
+        self.assert_not_retracted()
+        self.info.assert_not_called()
+
+    def test_update_failed_and_start_failed_says_the_restart_failed(self):
+        tail = steamcmd_tail("lychee-op-update: update failed (exit 8); start exit 1")
+        embed = self.run_failed(tail)
+
+        self.assertEqual(embed.fields[0].value, "```…" + tail[-500:] + "```")
+        self.assertIn("restart afterward also failed (exit 1)", embed.fields[1].value)
+        self.assertIn("systemctl status", embed.fields[1].value)
+        self.assert_not_retracted()
+
+    def test_update_stop_failure_retracts(self):
+        tail = steamcmd_tail(
+            "Failed to stop palworld-palchuds.service: Job timed out\n"
+            "lychee-op-update: stop failed (exit 1)"
+        )
+        embed = self.run_failed(tail)
+
         self.broadcast.assert_awaited_once()
         self.assertEqual(self.broadcast.call_args.args[0], "Update aborted")
         self.announce.assert_awaited_once()
         self.assertIn("Update cancelled", self.announce.call_args.args[0])
         self.assertIn("staying up", self.announce.call_args.args[0])
-        self.assertIn("not restarted", embed.fields[0].value)
+        self.assertIn("never taken down", embed.fields[0].value)
         self.assertTrue(any("Failed to stop" in field.value for field in embed.fields), embed.fields)
         self.info.assert_not_called()
+
+    def test_update_uses_the_last_marker_line(self):
+        """Output appended after the script's outcome (the recorder, the
+        restart guard) does not hide it, and an earlier marker-shaped line is
+        superseded by the last one."""
+        tail = steamcmd_tail(
+            "lychee-op-update: stop failed (exit 1)\n"
+            "lychee-op-update: update failed (exit 8); start exit 0\n"
+            "recorder: result written"
+        )
+        embed = self.run_failed(tail)
+        self.assertEqual(embed.fields[1].value, "Server was still restarted with the existing install.")
+        self.assert_not_retracted()
+
+    def test_update_without_a_marker_is_neutral_then_waits_for_rest(self):
+        """A killed or timed-out run, or a host without the new script: no
+        claim about why, no retraction, and the status says whether the
+        server came back."""
+        embed = self.run_failed(steamcmd_tail(None))
+
+        self.assert_not_retracted()
+        self.info.assert_awaited()
+        self.assertTrue(any("back online" in field.value for field in embed.fields), embed.fields)
+        self.assertTrue(any(field.value.startswith("```") for field in embed.fields), embed.fields)
+
+    def test_update_without_a_marker_and_rest_silent(self):
+        embed = self.run_failed(steamcmd_tail(None), info=AsyncMock(side_effect=ConnectionError("down")))
+
+        self.assert_not_retracted()
+        self.assertTrue(any("not responding" in field.value for field in embed.fields), embed.fields)
+        self.assertTrue(any("120s" in field.value for field in embed.fields), embed.fields)
+
+    def test_the_word_steamcmd_decides_nothing(self):
+        """The old rule: no "steamcmd" in the tail meant a failed stop. A
+        real steamcmd tail rarely contains the word, so its absence must not
+        retract, and its presence must not claim a restart."""
+        embed = self.run_failed(steamcmd_tail(None))
+        self.assert_not_retracted()
+        embed = self.run_failed("Running steamcmd +app_update 2394010 validate\n" + steamcmd_tail(None))
+        self.assert_not_retracted()
+        self.assertFalse(any("existing install" in field.value for field in embed.fields), embed.fields)
 
     def test_update_poll_timeout_is_35_minutes(self):
         ops = fake_host_ops()

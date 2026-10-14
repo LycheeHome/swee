@@ -7,8 +7,7 @@
 #
 # Re-running is a no-op except where real changes are needed: it will not
 # overwrite an existing .env, will not reinstall packages that are already
-# present, and will not touch sudoers/systemd files whose content already
-# matches.
+# present, and will not touch systemd files whose content already matches.
 set -euo pipefail
 
 SWEE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -55,36 +54,12 @@ if [ "$LOAD_STATE" != "loaded" ]; then
     echo "    (set PALWORLD_SERVICE_NAME in .env if your unit has a different name)."
 fi
 
-echo "==> Checking passwordless sudo for 'systemctl restart ${PALWORLD_SERVICE_NAME}'"
-SUDOERS_FILE="/etc/sudoers.d/swee-palworld-restart"
-SUDOERS_LINE="$SWEE_USER ALL=(root) NOPASSWD: /usr/bin/systemctl restart $PALWORLD_SERVICE_NAME"
-if [ "$(sudo cat "$SUDOERS_FILE" 2>/dev/null || true)" != "$SUDOERS_LINE" ]; then
-    TMP_SUDOERS="$(mktemp)"
-    echo "$SUDOERS_LINE" > "$TMP_SUDOERS"
-    sudo visudo -cf "$TMP_SUDOERS"
-    sudo install -m 440 -o root -g root "$TMP_SUDOERS" "$SUDOERS_FILE"
-    rm -f "$TMP_SUDOERS"
-    echo "    Installed $SUDOERS_FILE"
-else
-    echo "    Already configured, skipping"
-fi
-
-# There is deliberately no NOPASSWD grant for 'systemctl restart swee'.
-# One used to live here so a self-hosted CI runner could restart the bot
-# after deploying it; that deploy path is gone (see docs/deployment.md), so
-# the grant would be a standing sudo right with nothing left to use it.
-# If you wire up your own deployment and it needs to restart the service,
-# add the grant there, where whatever needs it is visible.
-
-# This script also does NOT install the three additional grants /update
-# needs (passwordless 'systemctl stop'/'systemctl start' for the Palworld
-# service, plus the host-side update wrapper) — it only ever installed the
-# single restart grant above. It can't install the wrapper even if it
-# wanted to: that binary is lychee-ops' artifact, rendered from that repo's
-# group_vars, not something a standalone script in this repo can produce.
-# See the README's "Running" section for the full grant list; on a host
-# set up only by this script, /update will abort at its own preflight
-# check rather than attempt anything against a live server.
+# swee holds no sudo grant at all. /restart, /update and the RAM
+# auto-restart reach the game server's unit through lychee-admin's
+# host-operations socket, which needs the bot's user in the `swee-api` group
+# (declared by lychee-ops on lychee, not by this script). A sudoers rule used
+# to be installed here for 'systemctl restart'; nothing uses it any more.
+# There is likewise no grant for 'systemctl restart swee'.
 
 echo "==> Checking '$SWEE_USER' can read unattended-upgrades logs (adm group)"
 if id -nG "$SWEE_USER" | tr ' ' '\n' | grep -qx adm; then
