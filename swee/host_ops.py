@@ -34,6 +34,11 @@ POLL_INTERVAL_S = 2.0
 # earlier than our POST, less this much clock slack.
 STALE_SLACK = timedelta(seconds=5)
 TERMINAL_STATES = frozenset({"succeeded", "failed"})
+# A terminal state with no usable startedAt (the action failed before its main
+# process ran: ExecStartPre failed, or start-limit-hit) is taken as this run's
+# once this long has passed since the wait began, well past the --no-block
+# window in which the previous run's result can still be read.
+UNDATED_GRACE_S = 10.0
 
 SENTENCE_BUSY = "an action is already running on the server"
 SENTENCE_NOT_ALLOWED = "swee is not allowed to do that"
@@ -47,10 +52,12 @@ _now = time.monotonic
 
 
 class HostOpsError(Exception):
-    def __init__(self, sentence: str, detail: str = ""):
+    def __init__(self, sentence: str, detail: str = "", status: int | None = None):
         super().__init__(sentence)
         self.sentence = sentence
         self.detail = detail
+        # The HTTP status for a refusal; None when nothing answered.
+        self.status = status
 
 
 @dataclass
@@ -93,13 +100,13 @@ def _refusal(response: httpx.Response) -> HostOpsError:
     message = error if isinstance(error, str) and error else response.text.strip()
     status = response.status_code
     if status == 409:
-        return HostOpsError(SENTENCE_BUSY, detail)
+        return HostOpsError(SENTENCE_BUSY, detail, status)
     if status in (403, 404):
-        return HostOpsError(SENTENCE_NOT_ALLOWED, detail)
+        return HostOpsError(SENTENCE_NOT_ALLOWED, detail, status)
     # 502 is lychee-admin saying the action could not be started. Anything
     # else unexpected (a 400, a 500) is reported the same way, with its text.
     sentence = f"{SENTENCE_COULD_NOT_START}: {message}" if message else SENTENCE_COULD_NOT_START
-    return HostOpsError(sentence, detail)
+    return HostOpsError(sentence, detail, status)
 
 
 def _last_line(log_tail: str) -> str | None:
@@ -168,33 +175,59 @@ class HostOps:
         timeout_s: float,
         on_line: Callable[[str], Awaitable[None]] | None = None,
     ) -> ActionState:
-        """Poll until this run's terminal state. Unreachable polls are
-        tolerated (lychee-admin restarts on every deploy while the action
-        itself keeps running); any other refusal is raised. A terminal state
-        with no startedAt cannot be shown to be this run's, so it is waited
-        past like a stale one."""
-        deadline = _now() + timeout_s
+        """Poll until this run's terminal state.
+
+        Tolerated, and polled past until the deadline: an unreachable socket
+        (lychee-admin restarts on every deploy while the action itself keeps
+        running) and a 5xx (lychee-admin could not read systemd's state this
+        once). A 403/404/409 is raised.
+
+        A terminal state is this run's when any of these holds: its startedAt
+        is no earlier than posted_at less the slack; a `running` state has
+        been seen since the POST (the POST succeeded only because nothing was
+        running, so the next terminal state is ours); or UNDATED_GRACE_S has
+        passed since the wait began, past the window in which the previous
+        run's result can still be read.
+
+        An exception from on_line is logged and the wait continues: failing
+        to edit a progress message must not abandon a running action."""
+        began = _now()
+        deadline = began + timeout_s
         earliest = posted_at - STALE_SLACK
+        seen_running = False
         last_reported: str | None = None
         while True:
+            current: ActionState | None = None
             try:
                 current = await self.state(action)
             except HostOpsError as error:
-                if error.sentence != SENTENCE_UNAVAILABLE:
+                transient = error.sentence == SENTENCE_UNAVAILABLE or (
+                    error.status is not None and error.status >= 500
+                )
+                if not transient:
                     raise
-                log.info("host-ops poll for %s unreachable: %s", action, error.detail)
-            else:
-                fresh = current.started_at is not None and current.started_at >= earliest
-                if current.state in TERMINAL_STATES and not fresh:
-                    pass  # the previous run's result
-                else:
+                log.info("host-ops poll for %s did not answer: %s", action, error.detail)
+            now = _now()
+            if current is not None:
+                if current.state == "running":
+                    seen_running = True
+                terminal = current.state in TERMINAL_STATES
+                ours = (
+                    (current.started_at is not None and current.started_at >= earliest)
+                    or seen_running
+                    or now - began >= UNDATED_GRACE_S
+                )
+                if not terminal or ours:
                     line = _last_line(current.log_tail)
                     if on_line is not None and line is not None and line != last_reported:
                         last_reported = line
-                        await on_line(line)
-                    if current.state in TERMINAL_STATES:
+                        try:
+                            await on_line(line)
+                        except Exception:
+                            log.warning("host-ops on_line failed for %s; still polling", action, exc_info=True)
+                    if terminal:
                         return current
-            if _now() >= deadline:
+            if now >= deadline:
                 raise HostOpsError(SENTENCE_UNAVAILABLE, f"no result for {action} after {timeout_s:.0f}s")
             await _sleep(POLL_INTERVAL_S)
 

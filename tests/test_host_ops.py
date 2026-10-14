@@ -220,6 +220,83 @@ class HostOpsWaitTests(unittest.TestCase):
         self.assertEqual(caught.exception.sentence, UNAVAILABLE)
 
 
+class HostOpsWaitUndatedAndTransientTests(unittest.TestCase):
+    """Fix round 1: a run that fails before its main process starts reports
+    a terminal state with no times, and a single 5xx read must not end the
+    wait while the action is still running."""
+
+    def run_wait(self, client, clock, *, timeout_s=300.0):
+        ticks = iter(clock)
+        with patch.object(host_ops, "_sleep", no_sleep), \
+             patch.object(host_ops, "_now", lambda: next(ticks)):
+            return asyncio.run(client.wait("restart", POSTED_AT, timeout_s))
+
+    def test_undated_failure_is_not_taken_before_10s_but_is_after(self):
+        undated = body("failed", log_tail="Failed to truncate")
+        client = HostOps(transport=sequence_transport([(200, undated), (200, undated)]))
+
+        # wait starts at 0; first poll at 2 s (too early), second at 12 s.
+        result = self.run_wait(client, [0.0, 2.0, 12.0])
+
+        self.assertEqual(result.state, "failed")
+        self.assertIsNone(result.started_at)
+        self.assertEqual(result.log_tail, "Failed to truncate")
+
+    def test_undated_failure_after_running_is_taken_immediately(self):
+        client = HostOps(transport=sequence_transport([
+            (200, body("running")),
+            (200, body("failed", log_tail="boom")),
+        ]))
+
+        result = self.run_wait(client, [0.0, 1.0, 2.0])
+
+        self.assertEqual(result.state, "failed")
+        self.assertEqual(result.log_tail, "boom")
+
+    def test_wait_survives_transient_5xx_polls(self):
+        fresh = POSTED_AT + timedelta(seconds=1)
+        client = HostOps(transport=sequence_transport([
+            (502, {"error": "could not read palworld-palchuds's actions"}),
+            (500, {"error": "internal error"}),
+            (200, body("succeeded", started=fresh, finished=fresh)),
+        ]))
+
+        result = self.run_wait(client, [0.0, 1.0, 2.0, 3.0])
+
+        self.assertEqual(result.state, "succeeded")
+
+    def test_a_failing_on_line_does_not_end_the_wait(self):
+        fresh = POSTED_AT + timedelta(seconds=1)
+        client = HostOps(transport=sequence_transport([
+            (200, body("running", started=fresh, log_tail="a")),
+            (200, body("running", started=fresh, log_tail="a\nb")),
+            (200, body("succeeded", started=fresh, finished=fresh, log_tail="a\nb")),
+        ]))
+        calls = []
+
+        async def on_line(line):
+            calls.append(line)
+            if len(calls) == 1:
+                raise RuntimeError("could not edit the progress message")
+
+        ticks = iter([0.0, 1.0, 2.0, 3.0])
+        with patch.object(host_ops, "_sleep", no_sleep), \
+             patch.object(host_ops, "_now", lambda: next(ticks)):
+            with self.assertLogs("swee", level="WARNING") as logs:
+                result = asyncio.run(client.wait("update", POSTED_AT, 300.0, on_line=on_line))
+
+        self.assertEqual(result.state, "succeeded")
+        self.assertEqual(calls, ["a", "b"])
+        self.assertTrue(any("could not edit" in line for line in logs.output), logs.output)
+
+    def test_start_still_maps_502_to_its_sentence(self):
+        client = HostOps(transport=sequence_transport([(502, {"error": "x"})]))
+        with self.assertRaises(HostOpsError) as caught:
+            asyncio.run(client.start("restart"))
+        self.assertEqual(caught.exception.sentence, "lychee-admin could not start it: x")
+        self.assertEqual(caught.exception.status, 502)
+
+
 class HostOpsRealSocketTests(unittest.TestCase):
     def test_over_a_real_unix_socket(self):
         directory = tempfile.mkdtemp(dir="/tmp")
