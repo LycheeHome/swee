@@ -1,76 +1,77 @@
+"""/update: update the game server through lychee-admin's host-operations
+socket (swee/host_ops.py). swee runs no sudo: lychee-ops' update script, run
+by lychee-admin as the unit's `update` action, stops the server, runs
+steamcmd and starts it again; swee warns players, saves the world, starts
+the action and reports on it."""
 import asyncio
 import logging
 import time
+from datetime import datetime, timezone
 
 import discord
 
 import swee.restart as restart_module
-from swee.config import ALERTS_CHANNEL_ID, COLOR_LEAVE, COLOR_READY, PALWORLD_SERVICE_NAME, RAM_RESTART_WARNING_SEC, SWEE_UPDATE_WRAPPER
+from swee.config import ALERTS_CHANNEL_ID, COLOR_LEAVE, COLOR_READY, PALWORLD_SERVICE_NAME, RAM_RESTART_WARNING_SEC
 from swee.embeds import broadcast_embed
+from swee.host_ops import SENTENCE_UNAVAILABLE, HostOpsError, host_ops
 from swee.rest_client import rest
-from swee.restart import warn_and_wait
+from swee.restart import LOG_TAIL_CHARS, REST_WAIT_S, warn_and_wait
 
 log = logging.getLogger("swee")
 
-# The three sudo grants /update depends on, checked in the order they're
-# used. Each entry is the exact argument list `sudo -n -l` is asked about —
-# it must match the command /update actually runs later, which is why the
-# wrapper entry carries no arguments: the sudoers drop-in pins it to zero.
-_REQUIRED_SUDO_GRANTS = (
-    ("systemctl", "stop", PALWORLD_SERVICE_NAME),
-    (SWEE_UPDATE_WRAPPER,),
-    ("systemctl", "start", PALWORLD_SERVICE_NAME),
-)
+# How long to poll lychee-admin for the update's result: the update service's
+# TimeoutStartSec=1800 plus slack.
+UPDATE_WAIT_S = 35 * 60
+
+# Indirections the tests patch, so they never touch the asyncio or time
+# modules every other caller shares.
+_sleep = asyncio.sleep
+_now = time.monotonic
 
 
-async def _missing_sudo_grant():
-    """The first of _REQUIRED_SUDO_GRANTS that isn't configured NOPASSWD
-    for this user, or None if all three are. Mirrors restart.py's
-    check_palworld_service, but async rather than subprocess.run: this
-    runs inside update_palworld(), which runs on the bot's event loop, and
-    a blocking call here would stall every other command while sudo is
-    consulted. Checked before anything else in update_palworld() — Phase 4
-    of the identity-separation migration narrows this exact grant from two
-    principals to one, and /update is how that narrowing gets verified, so
-    a mis-narrowed grant must be caught here, before a warning has gone out
-    to players and the world has been saved, not discovered only after.
+def _failed_embed(value, name="Status"):
+    embed = discord.Embed(title="Update failed", color=COLOR_LEAVE)
+    embed.add_field(name=name, value=value, inline=False)
+    return embed
 
-    Captures stderr from each `sudo -n -l` check. Per `man sudo` EXIT
-    VALUE, a non-zero return means an authentication failure, OR a
-    configuration/permission problem, OR that the given command can't be
-    executed at all — and only stderr says which. Discarding it (as this
-    used to) left the caller unable to tell a missing sudoers grant apart
-    from a missing/mis-pathed command.
-    """
-    for cmd in _REQUIRED_SUDO_GRANTS:
-        proc = await asyncio.create_subprocess_exec(
-            "sudo", "-n", "-l", *cmd,
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+
+def _shown_tail(log_tail):
+    tail = log_tail.strip()
+    if len(tail) > LOG_TAIL_CHARS:
+        return "…" + tail[-LOG_TAIL_CHARS:]
+    return tail
+
+
+async def _retract():
+    """Players were told the server is restarting for an update, and it is
+    not: retract the warning in Discord and in-game. Both are best-effort, so
+    a failed retraction cannot mask the failure being reported."""
+    await broadcast_embed(
+        "Update aborted",
+        f"Could not stop {PALWORLD_SERVICE_NAME} — the update was cancelled and "
+        "nothing was changed. The server was never taken down.",
+        COLOR_LEAVE,
+        channel_id=ALERTS_CHANNEL_ID,
+    )
+    # warn_and_wait announced in-game as well as in Discord, so a
+    # Discord-only retraction would leave the players who were actually told
+    # still expecting a restart. The server is up on this path.
+    try:
+        await rest.announce(
+            f"Update cancelled — {PALWORLD_SERVICE_NAME} could not be stopped. "
+            "The server is staying up."
         )
-        _, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            log.error(
-                "server update: 'sudo -n -l %s' failed (rc=%s): %s",
-                " ".join(cmd), proc.returncode,
-                stderr.decode(errors="replace").strip() or "(no stderr captured)",
-            )
-            return " ".join(cmd)
-    return None
+    except Exception:
+        log.warning("server update: in-game retraction failed", exc_info=True)
 
 
 async def update_palworld(on_progress=None):
-    missing_grant = await _missing_sudo_grant()
-    if missing_grant is not None:
-        log.error("server update: no usable sudo grant for '%s', aborting", missing_grant)
-        embed = discord.Embed(title="Update failed", color=COLOR_LEAVE)
-        embed.add_field(
-            name="Status",
-            value=f"No usable sudo grant for `{missing_grant}`. Nothing was touched — the "
-                  "grant may be missing, or the command itself may not be installed; check "
-                  "the sudoers drop-in and the command's path.",
-            inline=False,
-        )
-        return embed
+    # A refusal broadcasts nothing to players: check that lychee-admin would
+    # accept the update (reachable, allowed, nothing running, swee's own
+    # restart not in flight) before warning anyone.
+    refusal = await restart_module.host_control_refusal("update")
+    if refusal is not None:
+        return refusal
 
     warning_sec = int(RAM_RESTART_WARNING_SEC)
     if on_progress:
@@ -90,117 +91,91 @@ async def update_palworld(on_progress=None):
 
     restart_module._bot_restart_in_progress = True
     try:
-        if on_progress:
-            await on_progress("Stopping server…")
-        proc = await asyncio.create_subprocess_exec("sudo", "systemctl", "stop", PALWORLD_SERVICE_NAME)
-        stop_rc = await proc.wait()
-        if stop_rc != 0:
-            # Abort rather than continue. Running the update wrapper's
-            # steamcmd +app_update validate against a LIVE server is the
-            # dangerous half of this flow — until this check existed, a
-            # silently-failed stop led straight into it, then polled a
-            # server that had never gone down, found it up, and reported
-            # success.
-            log.error("server update: stop failed with rc=%s, aborting", stop_rc)
-            # Players already saw the "restarting in Ns for an update"
-            # warning (in-game and in the alerts channel) before this point
-            # — retract it so they aren't left thinking an update is still
-            # coming when the bot has in fact given up. broadcast_embed is
-            # itself best-effort (logs and swallows its own failures), so a
-            # failed retraction can't mask the real abort below.
-            await broadcast_embed(
-                "Update aborted",
-                f"Could not stop {PALWORLD_SERVICE_NAME} — the update was cancelled and "
-                "nothing was changed. The server was never taken down.",
-                COLOR_LEAVE,
-                channel_id=ALERTS_CHANNEL_ID,
-            )
-            # warn_and_wait announced in-game as well as in Discord, so a
-            # Discord-only retraction leaves the players who were actually
-            # told still expecting a restart. The server is up on this path
-            # — the abort below says so — so the REST announce will land.
-            # Best-effort: a failed retraction must not mask the real abort.
-            try:
-                await rest.announce(
-                    f"Update cancelled — {PALWORLD_SERVICE_NAME} could not be stopped. "
-                    "The server is staying up."
-                )
-            except Exception:
-                log.warning("server update: in-game retraction failed", exc_info=True)
-            embed = discord.Embed(title="Update failed", color=COLOR_LEAVE)
-            embed.add_field(
-                name="Status",
-                value=f"Could not stop {PALWORLD_SERVICE_NAME} (exit {stop_rc}). Nothing was "
-                      f"updated and the server was not restarted — check "
-                      f"`systemctl status {PALWORLD_SERVICE_NAME}` and `journalctl -u swee` "
-                      "(the stop/start subprocesses inherit this bot's own stdout/stderr, so "
-                      "systemctl's real error reaches the bot's log even when an "
-                      "already-recovered unit makes `systemctl status` alone look fine).",
-                inline=False,
-            )
-            return embed
-
-        if on_progress:
-            await on_progress("Updating via steamcmd… this can take a few minutes")
-        steamcmd_ok = False
-        steamcmd_output = ""
-        try:
-            steamcmd_proc = await asyncio.create_subprocess_exec(
-                "sudo", SWEE_UPDATE_WRAPPER,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-            )
-            stdout, _ = await steamcmd_proc.communicate()
-            steamcmd_ok = steamcmd_proc.returncode == 0
-            steamcmd_output = stdout.decode(errors="replace").strip()
-        except Exception as e:
-            log.exception("server update: failed to run the update wrapper")
-            steamcmd_output = str(e)
-
-        if on_progress:
-            await on_progress("Starting server…")
-        start_proc = await asyncio.create_subprocess_exec("sudo", "systemctl", "start", PALWORLD_SERVICE_NAME)
-        start_rc = await start_proc.wait()
-        if start_rc != 0:
-            # Not fatal — the liveness poll below already reports a server
-            # that doesn't come back. This just turns that into one
-            # identifiable line instead of a 120-second mystery.
-            log.error("server update: start failed with rc=%s", start_rc)
-
-        start = time.monotonic()
-        timeout = 120
-        online = False
-        while time.monotonic() - start < timeout:
-            try:
-                await rest.info()
-                online = True
-                break
-            except Exception:
-                await asyncio.sleep(5)
+        return await _run_update(on_progress)
     finally:
         restart_module._bot_restart_in_progress = False
 
-    if not steamcmd_ok:
-        embed = discord.Embed(title="Update failed", color=COLOR_LEAVE)
-        tail = steamcmd_output[-500:]
-        if len(steamcmd_output) > 500:
-            tail = "…" + tail
-        embed.add_field(name="steamcmd output", value=f"```{tail}```" if tail else "(no output)", inline=False)
-        if start_rc == 0:
-            embed.add_field(name="Status", value="Server was still restarted with the existing install.", inline=False)
-        else:
+
+async def _run_update(on_progress):
+    posted_at = datetime.now(timezone.utc)
+    try:
+        await host_ops.start("update")
+    except HostOpsError as error:
+        log.error("server update: %s (%s)", error.sentence, error.detail)
+        if error.status is not None:
+            # lychee-admin answered and refused (e.g. an action started
+            # between the preflight and this POST): nothing ran, so the
+            # warning players already saw is retracted. An unreachable socket
+            # is not retracted: whether the POST landed is unknown.
+            await _retract()
+        return _failed_embed(error.sentence)
+
+    if on_progress:
+        await on_progress("Updating via steamcmd… this can take a few minutes")
+
+    async def on_line(line):
+        if on_progress:
+            await on_progress(f"running · {line}")
+
+    try:
+        result = await host_ops.wait("update", posted_at, timeout_s=UPDATE_WAIT_S, on_line=on_line)
+    except HostOpsError as error:
+        log.error("server update: %s (%s)", error.sentence, error.detail)
+        if error.sentence == SENTENCE_UNAVAILABLE:
+            # wait() tolerates a briefly unreachable socket and raises this
+            # sentence only once UPDATE_WAIT_S has passed.
+            embed = discord.Embed(title="Update timed out", color=COLOR_LEAVE)
             embed.add_field(
                 name="Status",
-                value=f"The restart afterward also failed (exit {start_rc}) — check "
-                      f"`systemctl status {PALWORLD_SERVICE_NAME}`.",
+                value=f"No result from lychee-admin after {UPDATE_WAIT_S // 60} minutes — check "
+                      f"`systemctl status {PALWORLD_SERVICE_NAME}` and `journalctl -u lychee-admin`.",
                 inline=False,
             )
+            return embed
+        return _failed_embed(error.sentence)
+
+    if result.state != "succeeded":
+        log.error("server update: the update action ended %s: %s", result.state, result.log_tail)
+        tail = _shown_tail(result.log_tail)
+        if "steamcmd" in result.log_tail.lower():
+            # steamcmd ran and failed; lychee-ops' update script has already
+            # started the server again with the existing install.
+            embed = _failed_embed(f"```{tail}```" if tail else "(no output)", name="steamcmd output")
+            embed.add_field(
+                name="Status",
+                value="Server was still restarted with the existing install.",
+                inline=False,
+            )
+            return embed
+        # The log never reached steamcmd: the stop failed, so the server was
+        # never taken down and nothing was updated.
+        await _retract()
+        embed = _failed_embed(
+            f"Could not stop {PALWORLD_SERVICE_NAME}. Nothing was updated and the server was "
+            f"not restarted — check `systemctl status {PALWORLD_SERVICE_NAME}`."
+        )
+        if tail:
+            embed.add_field(name="Log", value=f"```\n{tail}\n```", inline=False)
         return embed
+
+    if on_progress:
+        await on_progress("Waiting for server to come back online…")
+    start = _now()
+    online = False
+    while _now() - start < REST_WAIT_S:
+        try:
+            await rest.info()
+            online = True
+            break
+        except Exception:
+            await _sleep(5)
 
     if not online:
         embed = discord.Embed(title="Update timed out", color=COLOR_LEAVE)
         embed.add_field(
             name="Status",
-            value=f"steamcmd succeeded but no response after {timeout}s — check `journalctl -u {PALWORLD_SERVICE_NAME}`",
+            value=f"steamcmd succeeded but no response after {REST_WAIT_S}s — check "
+                  f"`journalctl -u {PALWORLD_SERVICE_NAME}`",
         )
         return embed
 

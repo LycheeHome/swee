@@ -112,12 +112,13 @@ tick rather than skipping it. Leave `PALFEED_SERVICE_URL` unset/blank to disable
 
 ### Server update
 
-`/update` saves the world, stops the Palworld service, runs the host's `SWEE_UPDATE_WRAPPER` (a
-no-argument wrapper declared by `lychee-ops` that runs `steamcmd` against the pinned install as
-`steam`) to update and validate the dedicated server install, then starts the service back up. The
-shutdown this causes is treated as planned (no "restarted unexpectedly" alert), and the existing
-"Server is online" log-tailer message reports the new version once it's back up. If the wrapper
-fails, the service is still restarted with the previously-installed files rather than left down.
+`/update` warns players and saves the world, then asks lychee-admin to run the game unit's
+`update` action, which stops the Palworld service, runs `steamcmd` against the pinned install and
+starts the service back up; the command's status shows the action's latest log line while it runs.
+The shutdown this causes is treated as planned (no "restarted unexpectedly" alert), and the existing
+"Server is online" log-tailer message reports the new version once it's back up. If steamcmd fails,
+the service is still restarted with the previously-installed files rather than left down; if the
+stop fails, the warning is retracted in Discord and in-game.
 
 ## Setup
 
@@ -154,16 +155,8 @@ run as-is on Windows**.
 
 The systemd unit managing the Palworld service defaults to `palworld` — set `PALWORLD_SERVICE_NAME`
 in `.env` if yours is named differently (e.g. when running multiple Palworld servers on one host).
-The user running the bot must also have passwordless `sudo` configured for the
-`systemctl restart <PALWORLD_SERVICE_NAME>` command (e.g. via a `NOPASSWD` sudoers entry) —
-otherwise the bot exits immediately at startup with a clear error in the log.
-
-`/update` needs three more grants beyond that one: passwordless `systemctl stop` and
-`systemctl start` for the same service, plus the host's `SWEE_UPDATE_WRAPPER` (see
-[Server update](#server-update) above). None of these three are checked at startup the way the
-restart grant is — only `/update`'s own preflight catches a missing one, when the command is run.
-The wrapper itself is declared and installed by `lychee-ops`, not by this repo; see
-[`docs/deployment.md`](docs/deployment.md).
+swee runs no sudo: it reaches host control (`restart`, `update`) through lychee-admin's
+host-operations socket (`HOST_OPS_SOCKET`), so the user running the bot needs the `swee-api` group.
 
 ## Deployment
 

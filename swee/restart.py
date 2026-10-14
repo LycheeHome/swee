@@ -43,27 +43,28 @@ def check_palworld_service():
     return True
 
 
-def _failed_embed(sentence):
-    embed = discord.Embed(title="Restart failed", color=COLOR_LEAVE)
+def _failed_embed(sentence, title="Restart failed"):
+    embed = discord.Embed(title=title, color=COLOR_LEAVE)
     embed.add_field(name="Status", value=sentence, inline=False)
     return embed
 
 
-async def host_control_refusal():
-    """The "Restart failed" embed to show instead of warning anyone, when a
-    restart would be refused; None when nothing is in the way. Checked before
-    any warning, so that a refusal broadcasts nothing to players and shows
-    its own sentence."""
+async def host_control_refusal(action="restart"):
+    """The "<Action> failed" embed to show instead of warning anyone, when
+    the action (`restart` or `update`) would be refused; None when nothing is
+    in the way. Checked before any warning, so that a refusal broadcasts
+    nothing to players and shows its own sentence."""
+    title = f"{action.capitalize()} failed"
     if _bot_restart_in_progress:
         # swee's own restart or update is in flight; lychee-admin would answer
         # 409, so do not ask it.
-        log.error("restart refused: swee's own restart or update is still in flight")
-        return _failed_embed(SENTENCE_BUSY)
+        log.error("%s refused: swee's own restart or update is still in flight", action)
+        return _failed_embed(SENTENCE_BUSY, title)
     try:
         await host_ops.preflight()
     except HostOpsError as error:
-        log.error("restart refused before warning players: %s (%s)", error.sentence, error.detail)
-        return _failed_embed(error.sentence)
+        log.error("%s refused before warning players: %s (%s)", action, error.sentence, error.detail)
+        return _failed_embed(error.sentence, title)
     return None
 
 

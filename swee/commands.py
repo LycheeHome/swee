@@ -176,7 +176,7 @@ async def update(interaction: discord.Interaction):
         title="Updating Palworld server",
         color=COLOR_SHUTDOWN,
     )
-    embed.add_field(name="Status", value="Broadcasting update warning…")
+    embed.add_field(name="Status", value="Checking host control…")
     await interaction.response.send_message(embed=embed)
 
     async def on_progress(status):
