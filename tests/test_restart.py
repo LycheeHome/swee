@@ -6,7 +6,6 @@ grant can only be checked on the host.
 """
 import asyncio
 import os
-import subprocess
 import unittest
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -152,24 +151,15 @@ class RestartPalworldTests(unittest.TestCase):
         self.assertIn("120s", embed.fields[0].value)
 
 
-class CheckPalworldServiceTests(unittest.TestCase):
-    def check(self, load_state):
-        result = subprocess.CompletedProcess([], 0, stdout=f"{load_state}\n", stderr="")
-        with patch.object(restart.subprocess, "run", return_value=result) as run:
-            ok = restart.check_palworld_service()
-        return ok, run
+class NoUnitCheckTests(unittest.TestCase):
+    """swee runs in a container now, which has no systemctl: the startup
+    LoadState check is gone, and the host-ops socket read in main() is what
+    covers a missing unit (lychee-admin answers for the unit it operates)."""
 
-    def test_check_palworld_service_needs_no_sudo(self):
-        ok, run = self.check("loaded")
-        self.assertTrue(ok)
-        run.assert_called_once()
-        argv = run.call_args.args[0]
-        self.assertEqual(argv[:2], ["systemctl", "show"])
-        self.assertNotIn("sudo", argv)
-
-        with self.assertLogs("swee", level="ERROR"):
-            ok, _ = self.check("not-found")
-        self.assertFalse(ok)
+    def test_startup_unit_check_is_gone(self):
+        self.assertFalse(hasattr(restart, "check_palworld_service"))
+        self.assertFalse(hasattr(main, "check_palworld_service"))
+        self.assertFalse(hasattr(restart, "subprocess"))
 
 
 class RefusedBeforeWarningTests(unittest.TestCase):
@@ -242,7 +232,6 @@ class StartupTests(unittest.TestCase):
         ops = fake_host_ops(ping=False)
         start = AsyncMock()
         with patch.object(main, "host_ops", ops), \
-             patch.object(main, "check_palworld_service", return_value=True), \
              patch.object(main, "load_player_history"), \
              patch.object(main, "load_session_state"), \
              patch.object(main, "load_last_release"), \

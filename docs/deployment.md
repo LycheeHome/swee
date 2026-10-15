@@ -12,41 +12,82 @@ execution path onto the machine it runs on, because a fork supplies its own work
 therefore its own `runs-on:`.
 
 Deployment to the live bot is done by [`lychee-ops`](https://github.com/LycheeHome/lychee-ops),
-a private Ansible repo that runs `ansible-pull` on the host every five minutes. Each tick it:
+a private Ansible repo whose reconciler runs on the host, and swee is a **container** there, run
+from a declaration in `lychee-resources` (`swee.yml`) exactly as palsave-api is.
 
-1. reads the release tag pinned in its own `group_vars` as `swee_version`;
-2. checks this repository's Actions API for a **completed workflow run containing a job named
-   `test` that concluded `success`** for that tag's commit;
-3. only if that passes, checks out the tag, reinstalls dependencies, restarts `swee.service`,
-   and waits for the bot to reach Discord before calling it deployed.
+### The image
+
+Every release publishes `ghcr.io/lycheehome/swee:X.Y.Z` — the version without its `v`, the only
+tag form the reconciler recognises, and never `latest`. The `publish-image` job does it, chained
+off release-please's `release_created` output (a release made with `GITHUB_TOKEN` triggers no
+other workflow, so a `release:` event would never fire) and gated on both `test` and `image`, so a
+commit whose tests or smoke run failed publishes no image. The image carries
+`org.opencontainers.image.source=https://github.com/LycheeHome/swee`, so the package inherits this
+repository's access.
+
+The `image` job builds the image on every pull request and smoke-runs it the way the reconciler
+runs it: read-only root, every capability dropped, `no-new-privileges`, uid `993:980`, a fresh
+named volume at `/state` and **no** writable `/tmp`. With a dummy token the bot must reach
+Discord's login and fail there and only there; a write outside `/state` fails the job. It is
+deliberately not named `test` (see below): it gates the image, not the deploy gate.
+
+What the container expects of its host, all declared by lychee-ops:
+
+- **`/state`** — a volume, and the working directory. The five state files
+  (`player_history.json`, `session_state.json`, `last_release.json`, `palfeed_state.json`,
+  `last_palworld_settings.json`) keep their relative paths, so they land there. The image creates
+  `/state` owned by `993:980` so a fresh volume starts with that owner.
+- **`PALWORLD_EVENTS_FILE`** (default `/palworld-events/palworld.jsonl`) — the game unit's journal,
+  as lychee-ops' root forwarder `palworld-events.service` appends it (`journalctl -o json`, one
+  object per line, rotated daily with `copytruncate`). swee follows it from its end, so a restart
+  never replays old joins, and reopens it when it shrinks or is replaced. swee needs no `adm` to
+  read it, only the `palworld-events` group.
+- **`UNATTENDED_UPGRADES_LOG`** (default `/var/log/unattended-upgrades/unattended-upgrades.log`)
+  and **`PALWORLD_SETTINGS_INI_PATH`**, mounted read-only and read-write respectively.
+- **`HOST_OPS_SOCKET`** — lychee-admin's host-operations socket, the only way `/restart`,
+  `/update` and the RAM auto-restart reach the game unit. There is no `systemctl` in the image and
+  no startup check of the unit: a missing unit surfaces through that socket.
+- **The host network** (`network: host`), because the Palworld REST API and palsave-api answer on
+  the host's loopback.
+- **Secrets** in `/etc/lychee-secrets/swee.env` (`0600 root:root`); the reconciler refuses to start
+  the container without it.
+
+**Health.** Once logged in to Discord, swee rewrites `HEARTBEAT_FILE` (default
+`/state/heartbeat`) every 30 s, and the image's `HEALTHCHECK` calls the container unhealthy when
+that file is older than 90 s (or missing after a 120 s start period). That verdict is what
+lychee-admin's services board shows.
 
 ### What this changes for you
 
-**Merging the Release PR no longer deploys anything.** It cuts the tag and publishes the GitHub
-Release, which is all. Deploying that release is a separate, deliberate act: someone bumps
-`swee_version` in `lychee-ops` and merges it. That is the rollback lever too — pointing the pin
-at an older tag reverts the bot within one tick, with no access to the host required.
+**Merging the Release PR no longer deploys anything.** It cuts the tag, publishes the GitHub
+Release and pushes the image, which is all. Deploying that release is a separate, deliberate act:
+**Deploy** of the offered tag on lychee-admin's services board, which writes the tag into
+`swee.yml` in `lychee-resources`; the reconciler pulls and starts it on its next run. Rolling back
+is deploying an older tag the same way.
 
-**Do not rename the `test` job.** The gate matches a *job* named exactly `test` in
+**Do not rename the `test` job.** lychee-ops' gate matches a *job* named exactly `test` in
 `.github/workflows/ci.yml`. Renaming the job key, or adding a `name:` override (which replaces
 the name the API reports), breaks nothing loudly — it silently stops every future deploy, and
 the status file on the host then reports the tag as having no `test` job, which reads like CI
 never ran rather than like a rename.
 
-**A release cut before the `test` job existed can never be deployed.** The gate requires a green
-`test` for the pinned tag's commit, and that job was added in September 2026, so older releases
-block permanently rather than eventually succeeding. This is accepted behaviour: old versions
-age out of rollback range.
+**Releases before 2.13.0 have no image** and cannot be deployed as a container. Until the cutover
+in lychee-ops, swee also still runs as a host service pinned by `swee_version`; that install must
+set `PALWORLD_EVENTS_FILE=/var/log/palworld-events/palworld.jsonl` in `/opt/swee/.env`, since
+from 2.13.0 swee reads the forwarder's file instead of running `journalctl`.
 
 ### Deploying this bot somewhere else
 
-`deploy/setup.sh` remains the standalone install path and is unaffected by any of the above — it
+`deploy/setup.sh` remains the standalone, non-container install path — it
 creates the venv, installs dependencies, checks the Palworld service exists, and installs
 `swee.service`. It sets up a host; it does not wire up continuous deployment, and there is no
 longer anything in this repo that does. It installs no sudo grant, because swee needs none:
 `/restart`, `/update` and the RAM auto-restart reach the game server's unit through lychee-admin's
 host-operations socket (`HOST_OPS_SOCKET`), which requires the bot's user to be in the `swee-api`
-group. On `lychee`, `lychee-ops` declares that group membership and the socket's grant.
+group. On `lychee`, `lychee-ops` declares that group membership and the socket's grant. A host install also
+needs the events file: lychee-ops' forwarder, or any root process appending `journalctl -u <unit> -f
+-n 0 -o json --output-fields=MESSAGE,__REALTIME_TIMESTAMP` to a file the bot's user can read, named by
+`PALWORLD_EVENTS_FILE`.
 
 ## Versioning
 
@@ -62,8 +103,8 @@ On every push to `main`, release-please updates a standing **Release PR** (title
 version bump, though it may still appear in the changelog depending on release-please's default
 section mapping.
 
-**No release exists until you merge that Release PR.** Merging it tags the release and publishes
-the GitHub Release — and stops there. Ordinary feature PRs merging to `main` only update the
+**No release exists until you merge that Release PR.** Merging it tags the release, publishes
+the GitHub Release and pushes the image — and stops there. Ordinary feature PRs merging to `main` only update the
 Release PR's diff. Neither deploys anything; see Deployment above for what does.
 
 ### Cutting a release when nothing releasable has landed

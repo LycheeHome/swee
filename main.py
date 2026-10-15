@@ -7,19 +7,20 @@ import swee.commands  # noqa: F401 — registers slash commands via decorator si
 import swee.config_commands  # noqa: F401 — registers slash commands via decorator side effects
 from swee.bot import bot
 from swee.cause_detection import load_last_palworld_settings
-from swee.config import BOT_TOKEN, GITHUB_REPO, GUILD_ID, PALFEED_SERVICE_URL, RELAY_CHANNEL_ID
+from swee.config import BOT_TOKEN, GITHUB_REPO, GUILD_ID, HEARTBEAT_FILE, PALFEED_SERVICE_URL, RELAY_CHANNEL_ID
+from swee.heartbeat import heartbeat_loop
 from swee.host_ops import host_ops
 from swee.log_tailer import log_tailer
 from swee.palfeed import load_last_event_id, palfeed_ticker
 from swee.player_history import load_player_history, load_session_state
 from swee.releases import load_last_release, release_ticker
 from swee.rest_client import rest
-from swee.restart import check_palworld_service
 from swee.stats import stats_ticker
 
 log = logging.getLogger("swee")
 
 _log_tailer_task = None  # keeps a strong reference so asyncio doesn't GC it mid-run
+_heartbeat_task = None  # likewise; started only once logged in, see swee/heartbeat.py
 _startup_done = False  # on_ready can refire after a reconnect; run startup tasks only once
 
 
@@ -41,10 +42,12 @@ async def on_ready():
     guild = discord.Object(id=GUILD_ID)
     bot.tree.copy_global_to(guild=guild)
     await bot.tree.sync(guild=guild)
-    global _log_tailer_task, _startup_done
+    global _log_tailer_task, _heartbeat_task, _startup_done
     if not _startup_done:
         _startup_done = True
         _log_tailer_task = asyncio.create_task(log_tailer())
+        if HEARTBEAT_FILE:
+            _heartbeat_task = asyncio.create_task(heartbeat_loop(HEARTBEAT_FILE))
         stats_ticker.start()
         if GITHUB_REPO:
             release_ticker.start()
@@ -55,8 +58,9 @@ async def on_ready():
 
 async def main():
     discord.utils.setup_logging()
-    if not check_palworld_service():
-        raise SystemExit(1)
+    # No startup check of the game unit: there is no systemctl in swee's
+    # container. A missing unit surfaces through the host-ops socket, which
+    # answers for the unit lychee-admin operates.
     # Logged, never fatal: lychee-admin restarts on every one of its deploys,
     # and swee must not crash-loop through them. /restart and /update report
     # "host control is unavailable right now" while it is down.
@@ -81,6 +85,8 @@ async def main():
         palfeed_ticker.cancel()
         if _log_tailer_task:
             _log_tailer_task.cancel()
+        if _heartbeat_task:
+            _heartbeat_task.cancel()
         await rest.client.aclose()
 
 

@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project state
 
 `swee` is a Discord bot that bridges a Palworld dedicated server with a Discord server: it relays
-join/leave activity from the server's journalctl logs, keeps a live-updating stats embed
+join/leave activity from the server's journal (a file lychee-ops' forwarder writes), keeps a live-updating stats embed
 pinned in a channel, and exposes slash commands for status checks and admin actions (save, kick,
 ban, broadcast, restart, config view/edit) via Palworld's REST API and its `PalWorldSettings.ini`
 file. `main.py` is the entrypoint; bot logic lives in the `swee/` package (`bot.py`, `commands.py`,
@@ -26,11 +26,15 @@ concern). See `README.md` for architecture and setup details.
   the `host_ops` client (`swee/host_ops.py`, lychee-admin's host-operations socket) mocked
   throughout, so lychee-admin's grant and lychee-ops' restart/update scripts are only verified on
   the host; `tests/test_host_ops.py` covers the client itself and `tests/test_no_sudo.py` keeps
-  `sudo` out of swee. Run with
+  `sudo` out of swee; `tests/test_log_tailer.py` covers the events-file follower (start at end,
+  copytruncate, replacement), `tests/test_heartbeat.py` the health heartbeat, and
+  `tests/test_container.py` keeps `systemctl`/`journalctl` out and pins the Dockerfile. Run with
   `python -m unittest discover tests -v`. Still no test harness for the slash-command layer in
   `commands.py` itself — verify those manually.
-- The bot assumes it runs on the same Linux host as the Palworld server (it shells out to
-  `journalctl`/`systemctl` and reads `/proc/meminfo` directly) — it will not run as-is on Windows
+- swee ships as a container image (`Dockerfile`, published by ci.yml's `publish-image` job) and
+  runs read-only on `lychee` with host networking, deployed by lychee-ops. It runs no
+  `journalctl`/`systemctl` (neither exists in the image); it reads the forwarder's events file and
+  `/proc/meminfo` directly, so it must run on the Palworld server's Linux host — not as-is on Windows
 
 ## Working in this repo
 

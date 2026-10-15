@@ -5,7 +5,7 @@ import re
 from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
-from swee.config import ALERTS_CHANNEL_ID, COLOR_SHUTDOWN, PALWORLD_SETTINGS_INI_PATH
+from swee.config import ALERTS_CHANNEL_ID, COLOR_SHUTDOWN, PALWORLD_SETTINGS_INI_PATH, UNATTENDED_UPGRADES_LOG
 from swee.embeds import broadcast_embed
 from swee.palworld_settings import diff_palworld_settings, format_settings_change_fields, parse_palworld_settings
 
@@ -71,7 +71,6 @@ async def check_palworld_settings_change():
 
 
 # ---------- Unplanned-restart cause detection ----------
-UNATTENDED_UPGRADES_LOG = "/var/log/unattended-upgrades/unattended-upgrades.log"
 UPGRADE_LOG_RE = re.compile(
     r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ INFO Packages that will be upgraded: (.+)$'
 )
