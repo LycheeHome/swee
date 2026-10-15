@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -113,9 +114,19 @@ def _refusal(response: httpx.Response) -> HostOpsError:
 
 
 def _last_line(log_tail: str) -> str | None:
-    for line in reversed(log_tail.splitlines()):
-        if line.strip():
-            return line
+    """The last complete, non-blank line of a log tail.
+
+    steamcmd writes progress in pieces and redraws with a bare \\r, so a poll
+    can catch an unfinished last segment ("[  0"). lychee-admin keeps a trailing
+    newline exactly when the log file ends with one, so a tail that does not
+    end in \\n or \\r has an unfinished final segment, which is dropped.
+    """
+    segments = re.split(r"\r\n|\n|\r", log_tail)
+    if not log_tail.endswith(("\n", "\r")):
+        segments = segments[:-1]
+    for segment in reversed(segments):
+        if segment.strip():
+            return segment.strip()
     return None
 
 

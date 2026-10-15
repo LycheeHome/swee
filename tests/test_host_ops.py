@@ -231,8 +231,8 @@ class HostOpsWaitTests(unittest.TestCase):
         client = HostOps(transport=sequence_transport([
             (200, body("running", started=fresh, log_tail="a\nb")),
             (200, body("running", started=fresh, log_tail="a\nb\n")),
-            (200, body("running", started=fresh, log_tail="a\nb\nc")),
-            (200, body("succeeded", started=fresh, finished=fresh, log_tail="a\nb\nc")),
+            (200, body("running", started=fresh, log_tail="a\nb\nc\n")),
+            (200, body("succeeded", started=fresh, finished=fresh, log_tail="a\nb\nc\n")),
         ]))
         lines = []
 
@@ -241,7 +241,7 @@ class HostOpsWaitTests(unittest.TestCase):
 
         self.run_wait(client, on_line=on_line)
 
-        self.assertEqual(lines, ["b", "c"])
+        self.assertEqual(lines, ["a", "b", "c"])
 
     def test_wait_gives_up_after_timeout(self):
         fresh = POSTED_AT + timedelta(seconds=1)
@@ -305,9 +305,9 @@ class HostOpsWaitUndatedAndTransientTests(unittest.TestCase):
     def test_a_failing_on_line_does_not_end_the_wait(self):
         fresh = POSTED_AT + timedelta(seconds=1)
         client = HostOps(transport=sequence_transport([
-            (200, body("running", started=fresh, log_tail="a")),
-            (200, body("running", started=fresh, log_tail="a\nb")),
-            (200, body("succeeded", started=fresh, finished=fresh, log_tail="a\nb")),
+            (200, body("running", started=fresh, log_tail="a\n")),
+            (200, body("running", started=fresh, log_tail="a\nb\n")),
+            (200, body("succeeded", started=fresh, finished=fresh, log_tail="a\nb\n")),
         ]))
         calls = []
 
@@ -362,6 +362,22 @@ class HostOpsRealSocketTests(unittest.TestCase):
 
         self.assertEqual(result.state, "idle")
         self.assertEqual(requests, ["GET /v1/units/palworld-palchuds/actions/restart HTTP/1.1"])
+
+
+class LastLineTests(unittest.TestCase):
+    def test_complete_lines_only(self):
+        cases = [
+            ("a\nb\n[  0", "b"),
+            ("a\n[ 12%] Downloading\r[ 13%] Down", "[ 12%] Downloading"),
+            ("a\nb\n", "b"),
+            ("x\r", "x"),
+            ("a\r\nb\r\n", "b"),
+            ("", None),
+            ("only-fragment", None),
+        ]
+        for tail, expected in cases:
+            with self.subTest(tail=tail):
+                self.assertEqual(host_ops._last_line(tail), expected)
 
 
 if __name__ == "__main__":
