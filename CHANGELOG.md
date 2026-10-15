@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.13.0](https://github.com/LycheeHome/swee/compare/v2.12.0...v2.13.0) (2026-10-15)
+
+
+### Features
+
+* ship swee as an image that reads the game server's events from a file ([#77](https://github.com/LycheeHome/swee/issues/77)) ([e7ed7b1](https://github.com/LycheeHome/swee/commit/e7ed7b1ffa2d3e6b338f212a38918ed6d7fa7b44))
+
 ## [2.12.0](https://github.com/LycheeHome/swee/compare/v2.11.4...v2.12.0) (2026-10-14)
 
 
