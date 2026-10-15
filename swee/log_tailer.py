@@ -73,6 +73,12 @@ class FileFollower:
     - it rewinds when the file shrinks under it (logrotate's copytruncate,
       the rule lychee-ops installs);
     - it waits, quietly, for a file that does not exist yet;
+    - after an open that failed for any reason but ENOENT (a permission
+      error, say), it opens at the END again, as on first start: the file
+      existed all along and may hold a day of lines, so reading it from the
+      top would re-announce them. The exception is the file it was already
+      reading (same device and inode, not shorter than where it stopped),
+      which it resumes from where it left off, so nothing is lost or repeated;
     - it returns only complete lines and holds a partial last line until its
       newline arrives.
 
@@ -89,12 +95,20 @@ class FileFollower:
         self._id = None
         self._buf = b""
         self._open_failed = None
+        # True from an open failure other than ENOENT until the next open
+        # succeeds: what is in the file by then is of unknown age.
+        self._blind = False
+        # (device and inode, offset) of the file poll() last let go of, so a
+        # reopen after a failure can tell "the same file" from "a new one".
+        self._last = None
         self._open(at_end=True)
 
     def _open(self, at_end):
         try:
             f = open(self.path, "rb")
         except OSError as error:
+            if not isinstance(error, FileNotFoundError):
+                self._blind = True
             # Logged once per kind of failure, not every half second.
             kind = type(error).__name__
             if self._open_failed != kind:
@@ -105,12 +119,21 @@ class FileFollower:
                 self._open_failed = kind
             return False
         st = os.fstat(f.fileno())
+        file_id = (st.st_dev, st.st_ino)
         if at_end:
             f.seek(0, os.SEEK_END)
+        elif self._blind:
+            last_id, last_offset = self._last or (None, 0)
+            if last_id == file_id and st.st_size >= last_offset:
+                f.seek(last_offset)
+            else:
+                f.seek(0, os.SEEK_END)
         if self._open_failed is not None:
             log.info("log tailer: following %s", self.path)
         self._open_failed = None
-        self._file, self._id, self._buf = f, (st.st_dev, st.st_ino), b""
+        self._blind = False
+        self._last = None
+        self._file, self._id, self._buf = f, file_id, b""
         return True
 
     def _read(self):
@@ -128,8 +151,12 @@ class FileFollower:
                 st = None
             if st is None or (st.st_dev, st.st_ino) != self._id:
                 # Replaced or removed: the old file is drained (above); a
-                # partial line left in it will never be finished.
+                # partial line left in it will never be finished -- unless the
+                # same file comes back after a failed open, which resumes at
+                # the start of that partial line.
+                last = (self._id, self._file.tell() - len(self._buf))
                 self.close()
+                self._last = last
             elif st.st_size < self._file.tell():
                 # Truncated in place: start again from the top.
                 self._file.seek(0)

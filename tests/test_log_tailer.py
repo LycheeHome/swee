@@ -135,6 +135,65 @@ class FileFollowerTests(FollowerTestCase):
         self.assertEqual(follower.poll(), ["recreated"])
 
 
+def denied(*args, **kwargs):
+    raise PermissionError(13, "Permission denied")
+
+
+class OpenFailureTests(FollowerTestCase):
+    """An open that fails with anything but ENOENT says nothing about how old
+    the file's contents are -- it existed, and may hold a day of lines -- so
+    when it clears the follower must not read it from the top. Patched rather
+    than chmod'ed, because a suite run as root would open a 000 file anyway."""
+
+    def test_permission_error_that_clears_does_not_replay(self):
+        self.write("old join\nold leave\n")
+        with patch("swee.log_tailer.open", side_effect=denied, create=True):
+            follower = self.follower()
+            self.assertEqual(follower.poll(), [])
+        self.assertEqual(follower.poll(), [])
+        self.write("new\n")
+        self.assertEqual(follower.poll(), ["new"])
+
+    def test_replaced_file_unreadable_then_readable_does_not_replay(self):
+        self.write("")
+        follower = self.follower()
+        self.write("a\n")
+        self.assertEqual(follower.poll(), ["a"])
+        replacement = self.path + ".new"
+        with open(replacement, "w") as f:
+            f.write("written while unreadable\n")
+        os.replace(replacement, self.path)
+        with patch("swee.log_tailer.open", side_effect=denied, create=True):
+            self.assertEqual(follower.poll(), [])
+            self.assertEqual(follower.poll(), [])
+        self.assertEqual(follower.poll(), [])
+        self.write("fresh\n")
+        self.assertEqual(follower.poll(), ["fresh"])
+
+    def test_same_file_back_after_a_failure_resumes_where_it_left_off(self):
+        self.write("")
+        follower = self.follower()
+        self.write("a\n")
+        self.assertEqual(follower.poll(), ["a"])
+        held = self.path + ".held"
+        os.rename(self.path, held)
+        self.assertEqual(follower.poll(), [])
+        with open(held, "a") as f:
+            f.write("while away\n")
+        os.rename(held, self.path)
+        with patch("swee.log_tailer.open", side_effect=denied, create=True):
+            self.assertEqual(follower.poll(), [])
+        # The file it was reading: nothing before the remembered offset again,
+        # and nothing after it lost.
+        self.assertEqual(follower.poll(), ["while away"])
+
+    def test_enoent_alone_still_reads_a_new_file_from_its_start(self):
+        follower = self.follower()
+        self.assertEqual(follower.poll(), [])
+        self.write("created\n")
+        self.assertEqual(follower.poll(), ["created"])
+
+
 class SettingsTests(unittest.TestCase):
     def test_events_file_default(self):
         self.assertEqual(config.PALWORLD_EVENTS_FILE, "/palworld-events/palworld.jsonl")
