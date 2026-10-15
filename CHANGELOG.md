@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.13.1](https://github.com/LycheeHome/swee/compare/v2.13.0...v2.13.1) (2026-10-15)
+
+
+### Bug Fixes
+
+* update progress shows the last complete log line, not a fragment ([#80](https://github.com/LycheeHome/swee/issues/80)) ([dded905](https://github.com/LycheeHome/swee/commit/dded905c82d9d12c847e6f08fc81b42f0a19cedd))
+
 ## [2.13.0](https://github.com/LycheeHome/swee/compare/v2.12.0...v2.13.0) (2026-10-15)
 
 
