@@ -28,6 +28,21 @@ ANTHROPIC_API_KEY      = os.environ.get("ANTHROPIC_API_KEY")
 PALWORLD_SETTINGS_INI_PATH = os.environ["PALWORLD_SETTINGS_INI_PATH"]
 PALWORLD_SERVICE_NAME = os.environ.get("PALWORLD_SERVICE_NAME", "palworld")
 
+# The game unit's journal lines, as lychee-ops' root forwarder
+# (palworld-events.service) appends them: one `journalctl -o json` object per
+# line. swee tails this file rather than running journalctl, which a container
+# does not have and which needed swee in `adm`. The default is the
+# container's mount point; a host install points it at
+# /var/log/palworld-events/palworld.jsonl.
+PALWORLD_EVENTS_FILE = os.environ.get("PALWORLD_EVENTS_FILE", "/palworld-events/palworld.jsonl")
+# Read by the unplanned-restart cause detector (swee/cause_detection.py).
+UNATTENDED_UPGRADES_LOG = os.environ.get(
+    "UNATTENDED_UPGRADES_LOG", "/var/log/unattended-upgrades/unattended-upgrades.log"
+)
+# Rewritten every 30 s once logged in to Discord; the image's HEALTHCHECK
+# reads its age (swee/heartbeat.py). Blank disables it.
+HEARTBEAT_FILE = os.environ.get("HEARTBEAT_FILE", "/state/heartbeat")
+
 # lychee-admin's per-client host-operations socket (A-OPS-1), and the
 # inventory unit name swee operates through it. See swee/host_ops.py.
 HOST_OPS_SOCKET = os.environ.get("HOST_OPS_SOCKET", "/run/lychee-admin/clients/swee/api.sock")

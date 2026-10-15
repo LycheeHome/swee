@@ -16,8 +16,11 @@ actions (save, kick, ban, broadcast, restart).
 
 ### Activity relay
 
-`journalctl -u $PALWORLD_SERVICE_NAME -f` (`palworld` by default) is tailed for join/leave/
-shutdown/version log lines. Join/leave posts to `ACTIVITY_CHANNEL_ID` as embeds; server shutdown
+The game server's journal lines are tailed for join/leave/shutdown/version/chat lines. swee does not
+run `journalctl`: lychee-ops' root forwarder (`palworld-events.service`) appends the game unit's
+journal as JSON lines to a file, and swee follows `PALWORLD_EVENTS_FILE` (default
+`/palworld-events/palworld.jsonl`, the container's mount of `/var/log/palworld-events/palworld.jsonl`)
+from its end, reopening it when logrotate truncates it or it is replaced. Join/leave posts to `ACTIVITY_CHANNEL_ID` as embeds; server shutdown
 and server-online messages go to `ALERTS_CHANNEL_ID` instead.
 
 A shutdown triggered by `/restart` or the RAM auto-restart is reported as planned ("Server shutting
@@ -149,9 +152,9 @@ Slash commands are synced to `GUILD_ID` on startup. Admin-only commands (`save`,
 `ADMIN_ROLE_ID`. `config set` edits `PALWORLD_SETTINGS_INI_PATH` directly and does not itself
 restart the server — run `restart` afterward to apply the change.
 
-`restart` and the RAM reader shell out to `systemctl`/`/proc`, and `log_tailer` shells out to
-`journalctl`, so the bot must run on the same Linux host as the Palworld service — **it will not
-run as-is on Windows**.
+The RAM and CPU readers read `/proc`, and the activity relay reads the forwarder's events file, so
+the bot must run on the same Linux host as the Palworld service — **it will not run as-is on
+Windows**. It runs no `systemctl` or `journalctl`: none exists in its container.
 
 The systemd unit managing the Palworld service defaults to `palworld` — set `PALWORLD_SERVICE_NAME`
 in `.env` if yours is named differently (e.g. when running multiple Palworld servers on one host).
@@ -160,7 +163,17 @@ host-operations socket (`HOST_OPS_SOCKET`), so the user running the bot needs th
 
 ## Deployment
 
-For a Linux host you set up once and leave running, `deploy/setup.sh` automates the steps above
+**swee ships as a container image.** Each release publishes `ghcr.io/lycheehome/swee:X.Y.Z` (the
+tag without its `v`) from the `publish-image` job in `.github/workflows/ci.yml`, and on `lychee`
+it is deployed by [`lychee-ops`](https://github.com/LycheeHome/lychee-ops) from swee's declaration
+in `lychee-resources`: releasing is a tag plus Deploy on lychee-admin's services board. The
+container runs read-only as `993:980` (swee's host uid and gid), on the host network, with its
+state files in the `/state` volume (its working directory) and the forwarder's events file,
+`PalWorldSettings.ini`'s directory, the unattended-upgrades log and lychee-admin's host-operations
+socket mounted in. Its `HEALTHCHECK` reads `/state/heartbeat`, which swee rewrites every 30 s once
+logged in. See [`docs/deployment.md`](docs/deployment.md).
+
+For a Linux host you set up once and leave running without a container, `deploy/setup.sh` automates the steps above
 plus the systemd wiring: it creates the venv, installs dependencies, copies `.env.example` to
 `.env` (without overwriting an existing one), checks that the configured Palworld service exists,
 and installs/enables a `swee.service` unit (rendered from `deploy/swee.service`). It's safe to re-run — it skips any step that's already
@@ -176,9 +189,13 @@ sudo systemctl start swee
 
 Manage the running bot with `systemctl {status,stop,restart} swee` and `journalctl -u swee -f`.
 
-Pushes to `main` update a standing release-please Release PR; merging *that* PR tags a release.
-It does not deploy anything — deployment is done separately by `lychee-ops`, which installs a
-release tag pinned there once this repo's `test` job is green for it. See
+A host install reads the forwarder's file at its host path: set
+`PALWORLD_EVENTS_FILE=/var/log/palworld-events/palworld.jsonl`, and point `HEARTBEAT_FILE`
+somewhere writable or blank it.
+
+Pushes to `main` update a standing release-please Release PR; merging *that* PR tags a release and
+publishes its image. It does not deploy anything — deploying is a separate Deploy of that tag in
+lychee-admin. See
 [`docs/deployment.md`](docs/deployment.md) for the full CI/CD and versioning mechanics.
 
 ## Requirements

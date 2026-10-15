@@ -41,6 +41,46 @@ jobs:
           PALWORLD_SETTINGS_INI_PATH: /tmp/x
         run: python -c "import main"
 
+  # Deliberately not named `test`: lychee-ops' deploy gate matches every job
+  # named exactly `test`. This one gates publish-image instead (below).
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: docker build -t swee:ci .
+      - name: Smoke-run the image the way lychee-ops runs it
+        # Read-only root, every capability dropped, no-new-privileges, the
+        # image's own 993:980, a named volume at /state -- and deliberately NO
+        # tmpfs at /tmp: if the bot (or discord.py, httpx, anthropic) ever
+        # needs a writable /tmp or $HOME, this is where it shows, and the fix
+        # is lychee-ops' `tmpfs: /tmp` flag for swee, not a writable root.
+        # Dummy settings are the import check's: with a token of `x` the bot
+        # must get as far as asking Discord to log in and fail there, and
+        # only there.
+        run: |
+          set -u
+          docker volume create swee-ci-state >/dev/null
+          status=0
+          docker run --name swee-smoke --read-only --cap-drop ALL \
+            --security-opt no-new-privileges -v swee-ci-state:/state \
+            -e DISCORD_BOT_TOKEN=x -e GUILD_ID=1 -e ADMIN_ROLE_ID=1 \
+            -e RELAY_CHANNEL_ID=1 -e STATS_CHANNEL_ID=1 -e ACTIVITY_CHANNEL_ID=1 \
+            -e ALERTS_CHANNEL_ID=1 -e ADMIN_CHANNEL_ID=1 -e COMMANDS_CHANNEL_ID=1 \
+            -e BOT_UPDATES_CHANNEL_ID=1 -e REST_HOST=x -e REST_PORT=1 \
+            -e REST_USER=x -e REST_PASSWORD=x -e PALWORLD_SETTINGS_INI_PATH=/tmp/x \
+            swee:ci > smoke.log 2>&1 || status=$?
+          cat smoke.log
+          test "$status" -ne 0 || { echo "::error::the container exited 0 with a dummy token" >&2; exit 1; }
+          grep -q "logging in using static token" smoke.log \
+            || { echo "::error::the bot never attempted a Discord login" >&2; exit 1; }
+          grep -q "LoginFailure: Improper token has been passed" smoke.log \
+            || { echo "::error::the bot failed, but not on the dummy token" >&2; exit 1; }
+          if grep -Eq "Read-only file system|Permission denied|No usable temporary directory" smoke.log; then
+            echo "::error::the image wrote outside /state under a read-only root" >&2; exit 1
+          fi
+          test "$(docker run --rm -v swee-ci-state:/state --entrypoint stat swee:ci -c %u:%g /state)" = "993:980" \
+            || { echo "::error::a fresh /state volume is not owned by 993:980" >&2; exit 1; }
+
   release-please:
     # Push-only. The workflow gained a pull_request trigger so the test job
     # runs on PRs; without this guard release-please would run there too —
@@ -54,8 +94,51 @@ jobs:
       pull-requests: write
     outputs:
       release_created: ${{ steps.release.outputs.release_created }}
+      version: ${{ steps.release.outputs.version }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
     steps:
       - uses: googleapis/release-please-action@v4
         id: release
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-image:
+    # Chained off release-please rather than `on: release: published`: a
+    # release created with GITHUB_TOKEN (as release-please does here) does not
+    # trigger other workflows, so a release-event workflow would never fire.
+    #
+    # `test` and `image` are in needs: as well. Nothing gates the container
+    # path the way the source deploy was gated -- the reconciler pulls
+    # whatever tag a declaration names -- so a commit whose tests or smoke run
+    # failed must publish no image. It still cuts a release, and a
+    # declaration pinning that tag then fails loudly at pull time: the safe
+    # direction, and one someone can diagnose.
+    needs: [release-please, test, image]
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+      - name: Verify release-please emitted a version
+        run: |
+          test -n "${{ needs.release-please.outputs.version }}" || {
+            echo "release-please emitted no version output; see release-please-config.json release-type" >&2
+            exit 1
+          }
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          # X.Y.Z without the `v` (release-please's `version` output is
+          # already bare): the only form the reconciler recognises. No
+          # `latest` -- the reconciler's validator refuses a floating tag.
+          tags: ghcr.io/lycheehome/swee:${{ needs.release-please.outputs.version }}

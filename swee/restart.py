@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import subprocess
 import time
 from datetime import datetime, timezone
 
@@ -27,20 +26,6 @@ LOG_TAIL_CHARS = 500
 # modules every other caller shares.
 _sleep = asyncio.sleep
 _now = time.monotonic
-
-
-def check_palworld_service():
-    # Unprivileged: restarting the unit goes through lychee-admin's
-    # host-operations socket, whose availability is checked (and only logged)
-    # in main(), since lychee-admin restarts on every one of its deploys.
-    load_state = subprocess.run(
-        ["systemctl", "show", "-p", "LoadState", "--value", PALWORLD_SERVICE_NAME],
-        capture_output=True, text=True,
-    ).stdout.strip()
-    if load_state != "loaded":
-        log.error("%s.service not found (LoadState=%s) — check the unit is installed", PALWORLD_SERVICE_NAME, load_state or "unknown")
-        return False
-    return True
 
 
 def _failed_embed(sentence, title="Restart failed"):
